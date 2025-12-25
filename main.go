@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -29,6 +34,20 @@ var (
 	configPath string
 	recording  bool
 	audioFile  string
+)
+
+const chunkDir = "/tmp/voicetype-chunks"
+
+type ChunkResult struct {
+	Index int
+	Text  string
+}
+
+var (
+	chunkResults   map[int]string
+	chunkResultsMu sync.Mutex
+	chunkWg        sync.WaitGroup
+	vadCmd         *exec.Cmd
 )
 
 func main() {
@@ -147,19 +166,38 @@ func getActiveWindow() string {
 
 func startRecording() {
 	recording = true
-	audioFile = filepath.Join(os.TempDir(), fmt.Sprintf("voicetype-%d.wav", time.Now().UnixNano()))
+	chunkResults = make(map[int]string)
 
-	// Store the active window before we show visualizer
 	activeWin := getActiveWindow()
 	os.WriteFile(filepath.Join(os.TempDir(), "voicetype-window"), []byte(activeWin), 0600)
 
-	// Start recording with visualizer
 	go showVisualizer()
 
-	cmd := exec.Command("parecord", "--file-format=wav", "--channels=1", "--rate=16000", audioFile)
-	cmd.Start()
+	// Start VAD chunker
+	locations := []string{
+		filepath.Join(filepath.Dir(os.Args[0]), "vad_chunker.py"),
+		"/usr/local/share/voicetype/vad_chunker.py",
+		filepath.Join(os.Getenv("HOME"), ".local/share/voicetype/vad_chunker.py"),
+	}
+	var scriptPath string
+	for _, loc := range locations {
+		if _, err := os.Stat(loc); err == nil {
+			scriptPath = loc
+			break
+		}
+	}
 
-	// Watch for visualizer close (Enter/ESC pressed)
+	if scriptPath != "" {
+		vadCmd = exec.Command("/usr/bin/python3", scriptPath)
+		vadCmd.Start()
+		go watchChunks()
+	} else {
+		// Fallback to old recording method
+		audioFile = filepath.Join(os.TempDir(), fmt.Sprintf("voicetype-%d.wav", time.Now().UnixNano()))
+		cmd := exec.Command("parecord", "--file-format=wav", "--channels=1", "--rate=16000", audioFile)
+		cmd.Start()
+	}
+
 	go func() {
 		for recording {
 			time.Sleep(100 * time.Millisecond)
@@ -172,48 +210,209 @@ func startRecording() {
 		}
 	}()
 
-	fmt.Println("Recording started... Press hotkey again to stop.")
+	fmt.Println("Recording started...")
 }
 
 func stopRecording() {
 	recording = false
 
-	// Stop parecord
-	exec.Command("pkill", "-f", "parecord.*voicetype").Run()
-
-	// Hide visualizer
 	hideVisualizer()
 
-	// Check if cancelled with ESC
 	if wasCancelled() {
 		fmt.Println("Recording cancelled")
+		if vadCmd != nil {
+			vadCmd.Process.Kill()
+			vadCmd = nil
+		}
+		exec.Command("pkill", "-f", "parecord.*voicetype").Run()
+		exec.Command("pkill", "-f", "parec.*16000").Run()
+		os.RemoveAll(chunkDir)
 		os.Remove(audioFile)
 		return
 	}
 
 	fmt.Println("Recording stopped. Transcribing...")
-
-	// Show spinner
 	showSpinner()
 
-	// Transcribe
-	text := transcribeAudio(audioFile)
+	var text string
 
-	// Hide spinner
+	if vadCmd != nil {
+		// Chunked mode - stop VAD chunker and wait for final chunk
+		vadCmd.Process.Signal(syscall.SIGINT)
+		vadCmd.Wait()
+		vadCmd = nil
+
+		// Wait for done signal
+		for i := 0; i < 50; i++ {
+			if _, err := os.Stat(filepath.Join(chunkDir, "done")); err == nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// Process any remaining chunks in ready file
+		processReadyChunks()
+
+		// Wait for all uploads
+		chunkWg.Wait()
+
+		// Combine results in order
+		text = combineChunkResults()
+
+		os.RemoveAll(chunkDir)
+	} else {
+		// Legacy single-file mode
+		exec.Command("pkill", "-f", "parecord.*voicetype").Run()
+		text = transcribeAudio(audioFile)
+		os.Remove(audioFile)
+	}
+
 	hideSpinner()
 
 	if text != "" {
-		// Type into original window
 		winData, _ := os.ReadFile(filepath.Join(os.TempDir(), "voicetype-window"))
 		windowID := string(bytes.TrimSpace(winData))
 		typeText(windowID, text)
 	}
+}
 
-	os.Remove(audioFile)
+func watchChunks() {
+	readyPath := filepath.Join(chunkDir, "ready")
+	var lastPos int64 = 0
+
+	for recording {
+		time.Sleep(200 * time.Millisecond)
+
+		file, err := os.Open(readyPath)
+		if err != nil {
+			continue
+		}
+
+		file.Seek(lastPos, 0)
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if idx, err := strconv.Atoi(line); err == nil {
+				chunkPath := filepath.Join(chunkDir, fmt.Sprintf("chunk-%d.ogg", idx))
+				if _, err := os.Stat(chunkPath); err == nil {
+					chunkWg.Add(1)
+					go uploadChunk(chunkPath, idx)
+				}
+			}
+		}
+
+		pos, _ := file.Seek(0, 1)
+		lastPos = pos
+		file.Close()
+	}
+}
+
+func processReadyChunks() {
+	readyPath := filepath.Join(chunkDir, "ready")
+	data, err := os.ReadFile(readyPath)
+	if err != nil {
+		return
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if idx, err := strconv.Atoi(line); err == nil {
+			chunkResultsMu.Lock()
+			_, exists := chunkResults[idx]
+			chunkResultsMu.Unlock()
+
+			if !exists {
+				chunkPath := filepath.Join(chunkDir, fmt.Sprintf("chunk-%d.ogg", idx))
+				if _, err := os.Stat(chunkPath); err == nil {
+					chunkWg.Add(1)
+					go uploadChunk(chunkPath, idx)
+				}
+			}
+		}
+	}
+}
+
+func uploadChunk(path string, index int) {
+	defer chunkWg.Done()
+
+	text := transcribeChunk(path)
+
+	chunkResultsMu.Lock()
+	chunkResults[index] = text
+	chunkResultsMu.Unlock()
+
+	fmt.Printf("Chunk %d: %s\n", index, truncate(text, 50))
+}
+
+func transcribeChunk(audioPath string) string {
+	file, err := os.Open(audioPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("audio_file", filepath.Base(audioPath))
+	io.Copy(part, file)
+	writer.WriteField("translate_to_english", "false")
+	writer.Close()
+
+	req, _ := http.NewRequest("POST", "https://api.text-generator.io/api/v1/audio-file-extraction", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("secret", config.APIKey)
+
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("Chunk upload error:", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return ""
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result APIResponse
+	json.Unmarshal(body, &result)
+
+	return result.Text
+}
+
+func combineChunkResults() string {
+	chunkResultsMu.Lock()
+	defer chunkResultsMu.Unlock()
+
+	if len(chunkResults) == 0 {
+		return ""
+	}
+
+	indices := make([]int, 0, len(chunkResults))
+	for idx := range chunkResults {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+
+	var parts []string
+	for _, idx := range indices {
+		if text := chunkResults[idx]; text != "" {
+			parts = append(parts, text)
+		}
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func showVisualizer() {
-	// Find visualizer.py next to binary or in common locations
 	locations := []string{
 		filepath.Join(filepath.Dir(os.Args[0]), "visualizer.py"),
 		"/usr/local/share/voicetype/visualizer.py",
@@ -328,7 +527,7 @@ func transcribeAPI(audioPath string) string {
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("secret", config.APIKey)
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 300 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Println("API request error:", err)

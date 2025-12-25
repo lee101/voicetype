@@ -12,7 +12,7 @@ go build -o voicetype .
 # Install to ~/.local/bin and ~/.local/share
 mkdir -p ~/.local/bin ~/.local/share/voicetype
 cp voicetype ~/.local/bin/
-cp visualizer.py spinner.py fallback_asr.py ~/.local/share/voicetype/
+cp visualizer.py spinner.py fallback_asr.py vad_chunker.py ~/.local/share/voicetype/
 
 echo "Installed to ~/.local/bin/voicetype"
 

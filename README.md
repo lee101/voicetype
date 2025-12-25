@@ -5,7 +5,7 @@ Global hotkey voice-to-text for Linux. Press `Ctrl+Super+H` to record, press aga
 ## Install
 
 ```bash
-git clone https://github.com/youruser/voicetype && cd voicetype && ./install.sh
+git clone https://github.com/lee101/voicetype && cd voicetype && ./install.sh
 ```
 
 ## Setup
