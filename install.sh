@@ -12,7 +12,7 @@ go build -o voicetype .
 # Install to ~/.local/bin and ~/.local/share
 mkdir -p ~/.local/bin ~/.local/share/voicetype
 cp voicetype ~/.local/bin/
-cp visualizer.py spinner.py fallback_asr.py vad_chunker.py ~/.local/share/voicetype/
+cp visualizer.py spinner.py fallback_asr.py vad_chunker.py model_server.py ~/.local/share/voicetype/
 
 echo "Installed to ~/.local/bin/voicetype"
 
@@ -43,6 +43,22 @@ ExecStart=%h/.local/bin/voicetype
 Restart=on-failure
 Environment=DISPLAY=:0
 EnvironmentFile=-%h/.config/voicetype/env
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Model server service (optional - for faster local fallback)
+cat > ~/.config/systemd/user/voicetype-model.service << 'EOF'
+[Unit]
+Description=VoiceType Model Server
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/voicetype/model_server.py
+Restart=on-failure
+Environment=CUDA_VISIBLE_DEVICES=0
 
 [Install]
 WantedBy=default.target

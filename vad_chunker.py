@@ -90,11 +90,13 @@ class VADChunker:
             write_wav_header(f, len(audio_int16), SAMPLE_RATE)
             f.write(audio_int16.tobytes())
 
-        # compress to opus
+        # compress to opus with 1.3x speedup for faster transfer
         subprocess.run([
             'ffmpeg', '-y', '-i', wav_path,
+            '-af', 'atempo=1.3',
             '-ac', '1', '-ar', '16000',
-            '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip',
+            '-c:a', 'libopus', '-b:a', '16k', '-application', 'voip',
+            '-vbr', 'on', '-compression_level', '10',
             ogg_path
         ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         os.remove(wav_path)

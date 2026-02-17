@@ -171,6 +171,11 @@ func startRecording() {
 	activeWin := getActiveWindow()
 	os.WriteFile(filepath.Join(os.TempDir(), "voicetype-window"), []byte(activeWin), 0600)
 
+	// Preload local model in background (for fallback)
+	go preloadLocalModel()
+
+	os.WriteFile("/tmp/voicetype-visualizer-run", []byte("1"), 0600)
+	os.Remove("/tmp/voicetype-cancelled")
 	go showVisualizer()
 
 	// Start VAD chunker
@@ -410,6 +415,26 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func preloadLocalModel() {
+	locations := []string{
+		filepath.Join(filepath.Dir(os.Args[0]), "fallback_asr.py"),
+		"/usr/local/share/voicetype/fallback_asr.py",
+		filepath.Join(os.Getenv("HOME"), ".local/share/voicetype/fallback_asr.py"),
+	}
+
+	var scriptPath string
+	for _, loc := range locations {
+		if _, err := os.Stat(loc); err == nil {
+			scriptPath = loc
+			break
+		}
+	}
+
+	if scriptPath != "" {
+		exec.Command("/usr/bin/python3", scriptPath, "preload").Run()
+	}
 }
 
 func showVisualizer() {
