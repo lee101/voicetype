@@ -2,8 +2,12 @@
 import os
 import sys
 import subprocess
+import json
 import struct
 import tempfile
+import time
+import queue
+import threading
 import numpy as np
 
 SAMPLE_RATE = 16000
@@ -22,11 +26,14 @@ CHUNK_DIR = "/tmp/voicetype-chunks"
 SAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'samples')
 ROLLING_DIR = os.path.join(SAMPLES_DIR, 'rolling')
 UTTERANCE_DIR = os.path.join(SAMPLES_DIR, 'utterances')
-MAX_SAVED_SAMPLES = 5
+MAX_SAVED_SAMPLES = 10
 ROLLING_DURATION_S = 8.0
 ROLLING_MAX = 10
 UTTERANCE_MAX = 20
 MIN_UTTERANCE_S = 0.5
+SAMPLE_MIN_DURATION = 0.4
+SAMPLE_MIN_PEAK = 0.001
+SAMPLE_INDEX_PATH = os.path.join(SAMPLES_DIR, 'sample_index.json')
 
 
 def env_true(name, default=False):
@@ -39,7 +46,8 @@ def env_true(name, default=False):
 AGGRESSIVE_ENCODER = env_true("VOICETYPE_AGGRESSIVE_ENCODER")
 FORCE_DISABLE_VAD = env_true("VOICETYPE_DISABLE_VAD")
 FORCE_NO_PREPROCESS = env_true("VOICETYPE_DISABLE_PREPROCESS")
-SAVE_RAW_CHUNKS = env_true("VOICETYPE_SAVE_RAW_CHUNK", True)
+SAVE_RAW_CHUNKS = env_true("VOICETYPE_SAVE_RAW_CHUNK", False)
+SAMPLE_QUEUE_SIZE = 16
 
 
 def detect_best_source():
@@ -110,6 +118,7 @@ class VADChunker:
         self.preprocessor = None
         self.force_preprocess = not FORCE_NO_PREPROCESS
         self.sample_counter = 0
+        self.sample_records = []
         # rolling capture
         self.rolling_buf = []
         self.rolling_duration = 0.0
@@ -122,9 +131,13 @@ class VADChunker:
         self.utterance_counter = 0
         self.apply_silence_filter = AGGRESSIVE_ENCODER
         self.apply_atempo = AGGRESSIVE_ENCODER
+        self.sample_queue = queue.Queue(maxsize=SAMPLE_QUEUE_SIZE)
+        self._sample_worker = threading.Thread(target=self._sample_worker_loop, daemon=True)
         os.makedirs(SAMPLES_DIR, exist_ok=True)
         os.makedirs(ROLLING_DIR, exist_ok=True)
         os.makedirs(UTTERANCE_DIR, exist_ok=True)
+        self._load_sample_records()
+        self._sample_worker.start()
 
     def load_preprocessor(self):
         if not self.force_preprocess:
@@ -168,7 +181,6 @@ class VADChunker:
         return prob > 0.5
 
     def _save_audio_bg(self, audio_f32, path):
-        import threading
         def _save():
             wav_path = path.replace('.ogg', '.wav')
             try:
@@ -186,6 +198,39 @@ class VADChunker:
             except Exception as e:
                 print(f"save failed {path}: {e}", file=sys.stderr)
         threading.Thread(target=_save, daemon=True).start()
+
+    def _save_audio_sync(self, audio_f32, path):
+        audio_int16 = (audio_f32 * 32767).astype(np.int16)
+        tmp_wav = path + ".tmp.wav"
+        try:
+            with open(tmp_wav, 'wb') as f:
+                write_wav_header(f, len(audio_int16), SAMPLE_RATE)
+                f.write(audio_int16.tobytes())
+            subprocess.run([
+                'ffmpeg', '-y', '-i', tmp_wav,
+                '-ac', '1', '-ar', '16000',
+                '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip',
+                path
+            ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
+            os.remove(tmp_wav)
+            return True
+        except Exception as e:
+            print(f"sample sync save failed {path}: {e}", file=sys.stderr)
+            try:
+                if os.path.exists(tmp_wav):
+                    os.replace(tmp_wav, path)
+                    return True
+            except Exception:
+                pass
+            try:
+                os.remove(tmp_wav)
+            except Exception:
+                pass
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return False
 
     def _save_rolling(self, audio_f32):
         idx = self.rolling_counter % ROLLING_MAX
@@ -233,6 +278,86 @@ class VADChunker:
         peak = float(np.max(np.abs(audio_f32)))
         print(f"utterance_{idx} {dur:.1f}s peak={peak:.3f}", file=sys.stderr)
         self._save_audio_bg(audio_f32, path)
+        self._save_sample_candidate(audio_f32)
+
+    def _load_sample_records(self):
+        if not os.path.exists(SAMPLE_INDEX_PATH):
+            return
+        try:
+            with open(SAMPLE_INDEX_PATH) as f:
+                data = json.load(f)
+            for rec in data:
+                if not isinstance(rec, dict):
+                    continue
+                path = rec.get('path')
+                if path and os.path.exists(path):
+                    self.sample_records.append(rec)
+            self.sample_records.sort(key=lambda r: r.get('quality', 0), reverse=True)
+            self.sample_records = self.sample_records[:MAX_SAVED_SAMPLES]
+        except Exception:
+            self.sample_records = []
+
+    def _save_sample_records(self):
+        try:
+            with open(SAMPLE_INDEX_PATH, 'w') as f:
+                json.dump(self.sample_records, f, indent=2)
+        except Exception:
+            pass
+
+    def _sample_worker_loop(self):
+        while True:
+            item = self.sample_queue.get()
+            if item is None:
+                return
+            path, quality, duration, audio_f32 = item
+            if self._save_audio_sync(audio_f32, path):
+                self._register_top_sample(path, quality, duration)
+
+    def _sample_quality(self, audio_f32):
+        if audio_f32 is None or len(audio_f32) < int(SAMPLE_RATE * SAMPLE_MIN_DURATION):
+            return 0.0
+        dur = len(audio_f32) / float(SAMPLE_RATE)
+        peak = float(np.max(np.abs(audio_f32)))
+        if peak < SAMPLE_MIN_PEAK:
+            return 0.0
+        rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
+        return 0.7 * rms + 0.3 * min(1.0, dur / 8.0)
+
+    def _register_top_sample(self, path, quality, duration):
+        self.sample_records.append({
+            "path": path,
+            "quality": quality,
+            "duration": duration,
+            "created_at": int(time.time()),
+        })
+        self.sample_records.sort(key=lambda r: r.get('quality', 0), reverse=True)
+        if len(self.sample_records) > MAX_SAVED_SAMPLES:
+            for rec in self.sample_records[MAX_SAVED_SAMPLES:]:
+                old_path = rec.get('path')
+                if old_path and os.path.exists(old_path):
+                    try:
+                        os.remove(old_path)
+                    except Exception:
+                        pass
+            self.sample_records = self.sample_records[:MAX_SAVED_SAMPLES]
+        self._save_sample_records()
+
+    def _save_sample_candidate(self, audio_f32):
+        quality = self._sample_quality(audio_f32)
+        if quality <= 0:
+            return
+        worst_quality = self.sample_records[-1]["quality"] if self.sample_records else 0.0
+        if len(self.sample_records) >= MAX_SAVED_SAMPLES and quality <= worst_quality:
+            return
+        duration = len(audio_f32) / float(SAMPLE_RATE)
+        fname = f"sample_{int(time.time() * 1000)}_{self.sample_counter}.ogg"
+        self.sample_counter += 1
+        path = os.path.join(SAMPLES_DIR, fname)
+        audio_copy = np.array(audio_f32, dtype=np.float32)
+        try:
+            self.sample_queue.put_nowait((path, quality, duration, audio_copy))
+        except queue.Full:
+            pass
 
     def process_frame(self, raw_bytes):
         samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -288,27 +413,7 @@ class VADChunker:
 
     def save_sample(self, audio_f32):
         """Save rolling window of last N samples to disk."""
-        idx = self.sample_counter % MAX_SAVED_SAMPLES
-        self.sample_counter += 1
-        ogg_path = os.path.join(SAMPLES_DIR, f"sample_{idx}.ogg")
-        wav_path = os.path.join(SAMPLES_DIR, f"sample_{idx}.wav")
-        try:
-            audio_int16 = (audio_f32 * 32767).astype(np.int16)
-            with open(wav_path, 'wb') as f:
-                write_wav_header(f, len(audio_int16), SAMPLE_RATE)
-                f.write(audio_int16.tobytes())
-            subprocess.run([
-                'ffmpeg', '-y', '-i', wav_path,
-                '-ac', '1', '-ar', '16000',
-                '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip',
-                ogg_path
-            ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            os.remove(wav_path)
-            peak = float(np.max(np.abs(audio_f32)))
-            rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
-            print(f"saved sample_{idx}.ogg peak={peak:.3f} rms={rms:.3f}", file=sys.stderr)
-        except Exception as e:
-            print(f"sample save failed: {e}", file=sys.stderr)
+        self._save_sample_candidate(audio_f32)
 
     def emit_chunk(self):
         if len(self.buffer) < SAMPLE_RATE:
@@ -393,8 +498,32 @@ class VADChunker:
         self.silence_duration = 0.0
 
     def flush(self):
+        if self.in_utterance and self.utterance_buf:
+            self._save_sample_candidate(np.array(self.utterance_buf, dtype=np.float32))
+            self.in_utterance = False
+            self.utterance_buf = []
+            self.utterance_duration = 0.0
+            self.utt_silence = 0.0
+
+        if self.rolling_buf:
+            self._save_sample_candidate(np.array(self.rolling_buf, dtype=np.float32))
+            self.rolling_buf = []
+            self.rolling_duration = 0.0
+
         if len(self.buffer) > SAMPLE_RATE:
             self.emit_chunk()
+        try:
+            self.sample_queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self.sample_queue.get_nowait()
+            except Exception:
+                pass
+            try:
+                self.sample_queue.put_nowait(None)
+            except Exception:
+                pass
+        self._sample_worker.join(timeout=2.0)
         with open(os.path.join(CHUNK_DIR, "done"), 'w') as f:
             f.write("1")
 

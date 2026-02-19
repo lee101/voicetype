@@ -14,6 +14,72 @@ GROUND_TRUTH_PATH = os.path.join(TEST_AUDIO_DIR, 'ground_truth.json')
 WER_RESULTS_PATH = os.path.join(SCRIPT_DIR, 'wer_results.json')
 WER_HISTORY_PATH = os.path.join(SCRIPT_DIR, 'wer_history.json')
 SAMPLE_RATE = 16000
+PROVIDER_PRESETS = {
+    "auto": {
+        "default": {
+            "ffmpeg_filters": [],
+            "fallback_filters": [],
+            "bitrate": "16k",
+            "compression_level": 10,
+        },
+        "aggressive": {
+            "ffmpeg_filters": [
+                'silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB,'
+                'areverse,silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB,'
+                'areverse,atempo=1.3',
+            ],
+            "fallback_filters": ["atempo=1.3"],
+            "bitrate": "16k",
+            "compression_level": 10,
+        },
+        "speed": {
+            "ffmpeg_filters": ["silenceremove=start_periods=1:start_silence=0.08:start_threshold=-47dB,atempo=1.25"],
+            "fallback_filters": ["atempo=1.2"],
+            "bitrate": "12k",
+            "compression_level": 10,
+        },
+    },
+    "groq": {
+        "default": {
+            "ffmpeg_filters": [],
+            "fallback_filters": [],
+            "bitrate": "16k",
+            "compression_level": 10,
+        },
+        "speed": {
+            "ffmpeg_filters": ["silenceremove=start_periods=1:start_silence=0.06:start_threshold=-45dB,areverse,silenceremove=start_periods=1:start_silence=0.06:start_threshold=-45dB,areverse,atempo=1.3"],
+            "fallback_filters": ["atempo=1.2"],
+            "bitrate": "12k",
+            "compression_level": 10,
+        },
+        "tight": {
+            "ffmpeg_filters": ["silenceremove=start_periods=1:start_silence=0.05:start_threshold=-48dB,atempo=1.2"],
+            "fallback_filters": ["atempo=1.15"],
+            "bitrate": "14k",
+            "compression_level": 10,
+        },
+    },
+    "fal": {
+        "default": {
+            "ffmpeg_filters": [],
+            "fallback_filters": [],
+            "bitrate": "24k",
+            "compression_level": 10,
+        },
+        "speed": {
+            "ffmpeg_filters": ["silenceremove=start_periods=1:start_silence=0.08:start_threshold=-50dB,atempo=1.2"],
+            "fallback_filters": ["atempo=1.15"],
+            "bitrate": "18k",
+            "compression_level": 10,
+        },
+        "clean": {
+            "ffmpeg_filters": ["silenceremove=start_periods=1:start_silence=0.12:start_threshold=-55dB"],
+            "fallback_filters": [],
+            "bitrate": "24k",
+            "compression_level": 10,
+        },
+    },
+}
 
 
 def get_api_key():
@@ -28,34 +94,166 @@ def get_api_key():
     return key
 
 
-def transcribe_api(ogg_path):
-    key = get_api_key()
+def _read_env_key(name):
+    key = os.environ.get(name, '').strip()
     if key:
+        return key
+
+    for env_file in [os.path.expanduser('~/.secretbashrc'), os.path.expanduser('~/.config/voicetype/env')]:
+        if not os.path.exists(env_file):
+            continue
         try:
-            result = subprocess.run([
-                'curl', '-s', '-X', 'POST',
-                'https://api.text-generator.io/api/v1/audio-file-extraction',
-                '-H', f'secret: {key}',
-                '-F', f'audio_file=@{ogg_path}',
-                '-F', 'translate_to_english=false',
-            ], capture_output=True, text=True, timeout=60)
-            text = json.loads(result.stdout).get('text', '')
-            if text:
-                return text
-        except Exception as e:
-            print(f"primary API error: {e}", file=sys.stderr)
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(f'{name}='):
+                        return line.split('=', 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return ''
 
-    # fallback to fal whisper
+
+def get_groq_key():
+    return _read_env_key('GROQ_API_KEY')
+
+
+def get_fal_key():
+    return _read_env_key('FAL_KEY')
+
+
+def _normalize_provider(provider):
+    value = (provider or "auto").strip().lower()
+    if value in ("text-generator", "text_generator", "tg"):
+        return "auto"
+    if value in ("groq", "groqapi", "gpt", "openai"):
+        return "groq"
+    if value in ("fal", "fal_ai", "falai"):
+        return "fal"
+    if value in ("auto",):
+        return "auto"
+    return "auto"
+
+
+def list_encode_profiles(provider="auto"):
+    return list(PROVIDER_PRESETS.get(_normalize_provider(provider), PROVIDER_PRESETS["auto"]).keys())
+
+
+def transcribe_groq(audio_path):
+    key = get_groq_key()
+    if not key:
+        return ""
+
     try:
-        from fal_whisper import transcribe as fal_transcribe
-        text = fal_transcribe(ogg_path)
-        if text:
-            print(f"  (fal fallback)", file=sys.stderr)
-            return text
+        from groq import Groq
     except Exception as e:
-        print(f"fal fallback error: {e}", file=sys.stderr)
+        print(f"groq import failed: {e}", file=sys.stderr)
+        return ""
 
-    return ""
+    try:
+        client = Groq(api_key=key)
+        with open(audio_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                file=(audio_path, f.read()),
+                model="whisper-large-v3-turbo",
+                temperature=0,
+                response_format="verbose_json",
+            )
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            return result.get('text', '') or ''
+        return getattr(result, 'text', '') or ''
+    except Exception as e:
+        print(f"groq transcribe error: {e}", file=sys.stderr)
+        return ""
+
+
+def transcribe_fal(audio_path):
+    try:
+        from fal_whisper import transcribe
+        return transcribe(audio_path) or ""
+    except Exception as e:
+        print(f"fal transcribe error: {e}", file=sys.stderr)
+        return ""
+
+
+def transcribe_with_provider(ogg_path, provider="auto"):
+    provider = _normalize_provider(provider)
+    if provider == "groq":
+        text = transcribe_groq(ogg_path)
+        if text:
+            return text
+        return ""
+
+    if provider == "fal":
+        text = transcribe_fal(ogg_path)
+        if text:
+            return text
+        return ""
+
+    text = transcribe_groq(ogg_path)
+    if text:
+        return text
+    fallback = transcribe_fal(ogg_path)
+    if fallback:
+        print("  (fal fallback)", file=sys.stderr)
+    return fallback
+
+
+def transcribe_api(ogg_path):
+    return transcribe_with_provider(ogg_path, provider="auto")
+
+
+def _resolve_profile(provider, profile, aggressive):
+    provider = _normalize_provider(provider)
+    presets = PROVIDER_PRESETS.get(provider, PROVIDER_PRESETS["auto"])
+    if profile and profile in presets:
+        return profile, presets[profile]
+    if aggressive and "aggressive" in presets:
+        return "aggressive", presets["aggressive"]
+    if aggressive and "speed" in presets:
+        return "speed", presets["speed"]
+    return "default", presets["default"]
+
+
+def compress_to_ogg(audio_f32, path=None, aggressive=False, provider="auto", profile=None):
+    import tempfile
+    wav_path = path or tempfile.mktemp(suffix='.wav')
+    ogg_path = wav_path.replace('.wav', '.ogg')
+    profile_name, profile_cfg = _resolve_profile(provider, profile, aggressive)
+    write_wav(wav_path, audio_f32)
+
+    filter_chain = profile_cfg.get('ffmpeg_filters', [])
+    if isinstance(filter_chain, str):
+        filter_chain = [filter_chain]
+
+    cmd = ['ffmpeg', '-y', '-i', wav_path]
+    if filter_chain:
+        cmd += ['-af', ','.join(filter_chain)]
+    cmd += [
+        '-ac', '1', '-ar', str(SAMPLE_RATE),
+        '-c:a', 'libopus', '-b:a', profile_cfg.get('bitrate', '16k'), '-application', 'voip',
+        '-vbr', 'on', '-compression_level', str(profile_cfg.get('compression_level', 10)),
+        ogg_path,
+    ]
+    subprocess.run(cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+    if (profile_name == "aggressive" or profile_cfg.get("fallback_filters")) and (not os.path.exists(ogg_path) or os.path.getsize(ogg_path) < 100):
+        fallback_filters = profile_cfg.get('fallback_filters', [])
+        if isinstance(fallback_filters, str):
+            fallback_filters = [fallback_filters]
+        retry_cmd = ['ffmpeg', '-y', '-i', wav_path]
+        if fallback_filters:
+            retry_cmd += ['-af', ','.join(fallback_filters)]
+        retry_cmd += [
+            '-ac', '1', '-ar', str(SAMPLE_RATE),
+            '-c:a', 'libopus', '-b:a', profile_cfg.get('bitrate', '16k'), '-application', 'voip',
+            ogg_path,
+        ]
+        subprocess.run(retry_cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+    os.remove(wav_path)
+    return ogg_path
 
 
 def load_audio(path):
@@ -83,36 +281,6 @@ def write_wav(path, audio_f32):
         f.write(b'data')
         f.write(struct.pack('<I', n * 2))
         f.write(samples.tobytes())
-
-
-def compress_to_ogg(audio_f32, path=None, aggressive=False):
-    import tempfile
-    wav_path = path or tempfile.mktemp(suffix='.wav')
-    ogg_path = wav_path.replace('.wav', '.ogg')
-    write_wav(wav_path, audio_f32)
-
-    cmd = ['ffmpeg', '-y', '-i', wav_path]
-    if aggressive:
-        cmd += ['-af',
-            'silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB,'
-            'areverse,silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB,'
-            'areverse,atempo=1.3']
-    cmd += ['-ac', '1', '-ar', '16000',
-            '-c:a', 'libopus', '-b:a', '16k', '-application', 'voip',
-            '-vbr', 'on', '-compression_level', '10', ogg_path]
-    subprocess.run(cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-
-    if aggressive and (not os.path.exists(ogg_path) or os.path.getsize(ogg_path) < 100):
-        subprocess.run([
-            'ffmpeg', '-y', '-i', wav_path,
-            '-af', 'atempo=1.3',
-            '-ac', '1', '-ar', '16000',
-            '-c:a', 'libopus', '-b:a', '16k', '-application', 'voip',
-            ogg_path
-        ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-
-    os.remove(wav_path)
-    return ogg_path
 
 
 def normalize_text(text):
@@ -163,7 +331,7 @@ def load_ground_truth():
         return json.load(f)
 
 
-def test_params(params=None, ground_truth=None, aggressive=False):
+def test_params(params=None, ground_truth=None, aggressive=False, provider="auto", profile=None):
     from audio_preprocess import AudioPreprocessor
 
     if ground_truth is None:
@@ -183,8 +351,8 @@ def test_params(params=None, ground_truth=None, aggressive=False):
             continue
 
         processed = preprocessor.process(audio.copy())
-        ogg_path = compress_to_ogg(processed, aggressive=aggressive)
-        hyp_text = transcribe_api(ogg_path)
+        ogg_path = compress_to_ogg(processed, aggressive=aggressive, provider=provider, profile=profile)
+        hyp_text = transcribe_with_provider(ogg_path, provider=provider)
         w = wer(ref_text, hyp_text)
         results[fname] = {"wer": w, "ref": ref_text, "hyp": hyp_text}
         print(f"  {fname}: WER={w:.3f}")
@@ -201,7 +369,7 @@ def test_params(params=None, ground_truth=None, aggressive=False):
     return results
 
 
-def test_baseline(ground_truth=None, aggressive=False):
+def test_baseline(ground_truth=None, aggressive=False, provider="auto", profile=None):
     if ground_truth is None:
         ground_truth = load_ground_truth()
 
@@ -216,8 +384,8 @@ def test_baseline(ground_truth=None, aggressive=False):
         peak = np.max(np.abs(audio))
         if peak > 0.005:
             audio = audio * (0.9 / peak)
-        ogg_path = compress_to_ogg(audio, aggressive=aggressive)
-        hyp_text = transcribe_api(ogg_path)
+        ogg_path = compress_to_ogg(audio, aggressive=aggressive, provider=provider, profile=profile)
+        hyp_text = transcribe_with_provider(ogg_path, provider=provider)
         w = wer(ref_text, hyp_text)
         results[fname] = {"wer": w, "ref": ref_text, "hyp": hyp_text}
         print(f"  {fname}: WER={w:.3f} (baseline)")
@@ -259,6 +427,8 @@ def main():
     parser.add_argument('--generate-ground-truth', action='store_true')
     parser.add_argument('--params', help='path to params JSON')
     parser.add_argument('--baseline', action='store_true', help='test with no preprocessing')
+    parser.add_argument('--provider', default='auto', help='transcription provider: auto|groq|fal')
+    parser.add_argument('--encode-profile', default=None, help='encoding profile override')
     parser.add_argument('--aggressive', action='store_true',
                         help='apply silenceremove+atempo=1.3 encoding (off by default to match live pipeline)')
     args = parser.parse_args()
@@ -271,7 +441,7 @@ def main():
 
     if args.baseline:
         print("=== baseline (peak normalize only) ===")
-        results = test_baseline(gt, aggressive=args.aggressive)
+        results = test_baseline(gt, aggressive=args.aggressive, provider=args.provider, profile=args.encode_profile)
         save_results(results, "baseline")
         return
 
@@ -283,7 +453,7 @@ def main():
     else:
         print("=== testing with current/default params ===")
 
-    results = test_params(params, gt, aggressive=args.aggressive)
+    results = test_params(params, gt, aggressive=args.aggressive, provider=args.provider, profile=args.encode_profile)
     save_results(results, params)
 
 

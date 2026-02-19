@@ -52,7 +52,7 @@ You can also toggle capture/transcription safety for debugging misses:
 ```bash
 VOICETYPE_DISABLE_VAD=1 /usr/bin/python3 vad_chunker.py              # disable speech detection
 VOICETYPE_DISABLE_PREPROCESS=1 /usr/bin/python3 vad_chunker.py         # skip AudioPreprocessor
-VOICETYPE_SAVE_RAW_CHUNK=1 /usr/bin/python3 vad_chunker.py             # always write chunk-*.raw.ogg
+VOICETYPE_SAVE_RAW_CHUNK=1 /usr/bin/python3 vad_chunker.py             # additionally write chunk-*.raw.ogg for debugging
 ```
 
 ## WER Testing & Optimization
@@ -66,7 +66,51 @@ python3 wer_test.py --baseline                # measure WER without preprocessin
 python3 optimize.py --budget 100              # auto-optimize preprocessing params
 ```
 
+For optimization on real captured samples, use:
+
+```bash
+python3 optimize.py --use-real-samples --top-samples 10 --refresh-samples --aggressive-encode
+```
+
+### Automatic online learning
+
+After each recording, the daemon can auto-run optimization against the best recent samples (`samples/`) and update `optimized_params.json` automatically.
+
+Enable with:
+
+```bash
+export VOICETYPE_AUTO_LEARN=1
+```
+
+Useful tuning knobs:
+
+- `VOICETYPE_AUTO_LEARN_MIN_SAMPLES` (default `10`)
+- `VOICETYPE_AUTO_LEARN_TOP_SAMPLES` (default `10`)
+- `VOICETYPE_AUTO_LEARN_BUDGET` (default `90`)
+- `VOICETYPE_AUTO_LEARN_COOLDOWN_MIN` (default `45`)
+- `VOICETYPE_AUTO_LEARN_REFRESH_SAMPLES` (`0`/`1`, default `0`)
+- `VOICETYPE_AUTO_LEARN_AGGRESSIVE` (`0`/`1`, default `0`, enables `--aggressive-encode`)
+
+Keep `~/.config/voicetype/env` populated with:
+
+```bash
+TEXT_GENERATOR_API_KEY=...
+FAL_KEY=...
+```
+
+When sample capture is running, `vad_chunker.py` now keeps up to the best 10 snippets in `samples/` (plus full utterances in `samples/utterances/`). If recordings are long, full chunks are still written to `/tmp/voicetype-chunks` as before.
+
 Optimized params are saved to `optimized_params.json` and loaded automatically.
+
+If you are running the installed user service (`~/.local/bin/voicetype`), make sure to redeploy after edits:
+
+```bash
+go build -o ~/.local/bin/voicetype .
+cp *.py ~/.local/share/voicetype/
+systemctl --user restart voicetype
+```
+
+This repo keeps working scripts at `~/code/voicetype/...`; after rebuild, the service will also pick them up automatically.
 
 ## Debug Pipeline vs Raw Transcription
 

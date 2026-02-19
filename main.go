@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -40,6 +41,15 @@ var (
 
 const chunkDir = "/tmp/voicetype-chunks"
 const localModelSocket = "/tmp/voicetype-model.sock"
+const localModelGlobalLockPath = "/tmp/voicetype-model.lock"
+const hotkeyGlobalLockPath = "/tmp/voicetype-hotkey.lock"
+const (
+	defaultAutoLearnBudget         = 90
+	defaultAutoLearnTopSamples     = 10
+	defaultAutoLearnMinSamples     = 10
+	defaultAutoLearnWarmupUses      = 10
+	defaultAutoLearnCooldownMins   = 45
+)
 
 type ChunkResult struct {
 	Index int
@@ -52,11 +62,22 @@ var (
 	chunkWg        sync.WaitGroup
 	vadCmd         *exec.Cmd
 	localModelMu   sync.Mutex
+	recordingMu    sync.Mutex
 	localModelReady bool
 	localModelWarming bool
 	instanceRecordingFlag string
 	lastHotkeyTime time.Time
-)
+	autoLearnMu sync.Mutex
+	autoLearnRunning bool
+	autoLearnLastSignature string
+	autoLearnLastRan time.Time
+	autoLearnStatePath string
+	instanceLock *os.File
+ )
+
+type AutoLearnState struct {
+	UseCount int `json:"use_count"`
+}
 
 var nemoPythonPath = findNemoPython()
 
@@ -79,8 +100,19 @@ type localASRResponse struct {
 }
 
 func main() {
+	if !getEnvBool("VOICETYPE_ALLOW_MULTI_INSTANCE", false) && !acquireInstanceLock() {
+		fmt.Println("Another voicetype instance is already running. Exiting.")
+		return
+	}
+	defer func() {
+		if instanceLock != nil {
+			instanceLock.Close()
+		}
+	}()
+
 	home, _ := os.UserHomeDir()
 	configPath = filepath.Join(home, ".config", "voicetype", "config.json")
+	autoLearnStatePath = filepath.Join(filepath.Dir(configPath), "auto_learn_state.json")
 	instanceRecordingFlag = filepath.Join(os.TempDir(), fmt.Sprintf("voicetype-recording-%d", os.Getpid()))
 	loadConfig()
 
@@ -131,6 +163,439 @@ func loadConfig() {
 	}
 }
 
+func acquireInstanceLock() bool {
+	lockPath := filepath.Join(os.TempDir(), "voicetype.lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return true
+	}
+
+	// Try to obtain an exclusive lock without blocking so a second process
+	// exits instead of racing for audio hardware and trigger files.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return false
+	}
+
+	_ = f.Truncate(0)
+	_, _ = f.WriteString(fmt.Sprintf("%d\n", os.Getpid()))
+	instanceLock = f
+	return true
+}
+
+func setRecording(active bool) bool {
+	recordingMu.Lock()
+	defer recordingMu.Unlock()
+	if active {
+		if recording {
+			return false
+		}
+		recording = true
+		return true
+	}
+	if !recording {
+		return false
+	}
+	recording = false
+	return true
+}
+
+func isRecording() bool {
+	recordingMu.Lock()
+	defer recordingMu.Unlock()
+	return recording
+}
+
+func withNamedLock(lockPath string, timeout time.Duration, fn func() error) error {
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+
+	deadline := time.Now().Add(timeout)
+	var lockErr error
+	for {
+		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+			return fn()
+		} else {
+			lockErr = err
+		}
+		if time.Now().After(deadline) {
+			return lockErr
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func withHotkeyLock(fn func() error) error {
+	return withNamedLock(hotkeyGlobalLockPath, 500*time.Millisecond, fn)
+}
+
+func withModelLock(fn func() error) error {
+	return withNamedLock(localModelGlobalLockPath, 30*time.Second, fn)
+}
+
+func setLocalModelReady(ready bool) {
+	localModelMu.Lock()
+	localModelReady = ready
+	localModelWarming = false
+	localModelMu.Unlock()
+}
+
+func isLocalModelReady() bool {
+	localModelMu.Lock()
+	defer localModelMu.Unlock()
+	return localModelReady
+}
+
+func getEnvFileValue(key string) string {
+	if configPath == "" {
+		return ""
+	}
+	candidates := []string{
+		filepath.Join(filepath.Dir(configPath), "env"),
+		filepath.Join(os.Getenv("HOME"), ".secretbashrc"),
+	}
+	for _, envFile := range candidates {
+		envData, err := os.ReadFile(envFile)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(envData), "\n") {
+			line = strings.TrimSpace(line)
+			prefix := key + "="
+			if strings.HasPrefix(line, prefix) {
+				return strings.Trim(strings.SplitN(line, "=", 2)[1], "\"' ")
+			}
+		}
+	}
+	return ""
+}
+
+func ensureAutoLearnStateDir() {
+	if autoLearnStatePath == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(autoLearnStatePath), 0o755)
+}
+
+func incrementAutoLearnUseCount() int {
+	if autoLearnStatePath == "" {
+		return 1
+	}
+	ensureAutoLearnStateDir()
+	state := AutoLearnState{}
+	if data, err := os.ReadFile(autoLearnStatePath); err == nil {
+		_ = json.Unmarshal(data, &state)
+	}
+	state.UseCount++
+	data, _ := json.Marshal(state)
+	_ = os.WriteFile(autoLearnStatePath, data, 0644)
+	return state.UseCount
+}
+
+func getGroqKey() string {
+	if key := strings.TrimSpace(os.Getenv("GROQ_API_KEY")); key != "" {
+		return key
+	}
+	return getEnvFileValue("GROQ_API_KEY")
+}
+
+func resolveAutoLearnProvider() string {
+	provider := strings.TrimSpace(os.Getenv("VOICETYPE_AUTO_LEARN_PROVIDER"))
+	if provider != "" {
+		return provider
+	}
+	if getGroqKey() != "" {
+		return "groq"
+	}
+	if config.FalKey != "" {
+		return "fal"
+	}
+	return "auto"
+}
+
+func resolveAutoLearnProfile(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "groq":
+		return "speed"
+	case "fal":
+		return "clean"
+	default:
+		return "default"
+	}
+}
+
+func getEnvBool(name string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "yes", "on", "y":
+		return true
+	case "0", "false", "no", "off", "n":
+		return false
+	default:
+		return def
+	}
+}
+
+func getEnvInt(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	return def
+}
+
+func setEnvValue(env []string, key, value string) []string {
+	if value == "" {
+		return env
+	}
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func hashSignature(data string) string {
+	sum := sha1.Sum([]byte(data))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func isAudioFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".wav", ".ogg", ".mp3", ".m4a", ".flac", ".webm":
+		return true
+	default:
+		return false
+	}
+}
+
+func listSamples(samplesDir string) ([]string, error) {
+	candidates := []string{
+		samplesDir,
+		filepath.Join(samplesDir, "utterances"),
+		filepath.Join(samplesDir, "rolling"),
+	}
+	seen := make(map[string]struct{})
+	var out []string
+
+	for _, root := range candidates {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			full := filepath.Join(root, entry.Name())
+			if isAudioFile(full) {
+				if _, exists := seen[full]; !exists {
+					seen[full] = struct{}{}
+					out = append(out, full)
+				}
+			}
+		}
+	}
+
+	return out, nil
+}
+
+func getSampleStats(samplesDir string) (count int, signature string, err error) {
+	indexPath := filepath.Join(samplesDir, "sample_index.json")
+	if indexBytes, readErr := os.ReadFile(indexPath); readErr == nil {
+		type sampleRec struct {
+			Path string `json:"path"`
+		}
+		var recs []sampleRec
+		if err := json.Unmarshal(indexBytes, &recs); err == nil {
+			valid := 0
+			for _, r := range recs {
+				if r.Path != "" {
+					if _, err := os.Stat(r.Path); err == nil {
+						valid++
+					}
+				}
+			}
+			return valid, hashSignature(string(indexBytes)), nil
+		}
+	}
+
+	paths, listErr := listSamples(samplesDir)
+	if listErr != nil {
+		return 0, "", listErr
+	}
+	if len(paths) == 0 {
+		return 0, "", nil
+	}
+
+	hash := sha1.New()
+	for _, path := range paths {
+		hash.Write([]byte(path))
+		info, infoErr := os.Stat(path)
+		if infoErr != nil {
+			continue
+		}
+		hash.Write([]byte(strconv.FormatInt(info.Size(), 10)))
+		hash.Write([]byte(strconv.FormatInt(info.ModTime().UnixNano(), 10)))
+	}
+	return len(paths), fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func startAutoOptimization() {
+	if !getEnvBool("VOICETYPE_AUTO_LEARN", true) {
+		return
+	}
+	if config.APIKey == "" && config.FalKey == "" && getGroqKey() == "" {
+		fmt.Println("auto-learning skipped: no API key configured")
+		return
+	}
+
+	warmupUses := getEnvInt("VOICETYPE_AUTO_LEARN_WARMUP_USES", defaultAutoLearnWarmupUses)
+	if warmupUses < 1 {
+		warmupUses = defaultAutoLearnWarmupUses
+	}
+	useCount := incrementAutoLearnUseCount()
+	if useCount < warmupUses {
+		fmt.Printf("auto-learning skipped: warmup %d/%d voicetype uses\n", useCount, warmupUses)
+		return
+	}
+
+	minSamples := getEnvInt("VOICETYPE_AUTO_LEARN_MIN_SAMPLES", defaultAutoLearnMinSamples)
+	if minSamples <= 0 {
+		minSamples = defaultAutoLearnMinSamples
+	}
+	topSamples := getEnvInt("VOICETYPE_AUTO_LEARN_TOP_SAMPLES", defaultAutoLearnTopSamples)
+	if topSamples <= 0 {
+		topSamples = defaultAutoLearnTopSamples
+	}
+	budget := getEnvInt("VOICETYPE_AUTO_LEARN_BUDGET", defaultAutoLearnBudget)
+	if budget <= 0 {
+		budget = defaultAutoLearnBudget
+	}
+	cooldownMins := getEnvInt("VOICETYPE_AUTO_LEARN_COOLDOWN_MIN", defaultAutoLearnCooldownMins)
+	if cooldownMins < 0 {
+		cooldownMins = 0
+	}
+
+	vadScript := findScriptPath("vad_chunker.py")
+	if vadScript == "" {
+		fmt.Println("auto-learning skipped: vad_chunker.py not found")
+		return
+	}
+	samplesDir := filepath.Join(filepath.Dir(vadScript), "samples")
+	scriptDir := filepath.Dir(vadScript)
+	optimizeScript := findScriptPath("optimize.py")
+	if optimizeScript == "" {
+		optimizeScript = filepath.Join(scriptDir, "optimize.py")
+	}
+	if _, err := os.Stat(optimizeScript); err != nil {
+		fmt.Println("auto-learning skipped: optimize.py not found")
+		return
+	}
+
+	count, signature, err := getSampleStats(samplesDir)
+	if err != nil {
+		fmt.Printf("auto-learning skipped: sample scan failed (%v)\n", err)
+		return
+	}
+	if count < minSamples {
+		fmt.Printf("auto-learning skipped: %d samples, need %d\n", count, minSamples)
+		return
+	}
+	if topSamples > count {
+		topSamples = count
+	}
+
+	autoLearnMu.Lock()
+	if autoLearnRunning {
+		autoLearnMu.Unlock()
+		return
+	}
+
+	cooldown := time.Duration(cooldownMins) * time.Minute
+	if !autoLearnLastRan.IsZero() && !autoLearnLastSignatureEmpty(autoLearnLastSignature) && signature == autoLearnLastSignature && time.Since(autoLearnLastRan) < cooldown {
+		autoLearnMu.Unlock()
+		return
+	}
+
+	autoLearnRunning = true
+	autoLearnLastSignature = signature
+	autoLearnLastRan = time.Now()
+	autoLearnMu.Unlock()
+
+	go func() {
+		defer func() {
+			autoLearnMu.Lock()
+			autoLearnRunning = false
+			autoLearnMu.Unlock()
+		}()
+
+		args := []string{
+			optimizeScript,
+			"--use-real-samples",
+			"--samples-dir", samplesDir,
+			"--top-samples", strconv.Itoa(topSamples),
+			"--budget", strconv.Itoa(budget),
+		}
+		autoProvider := resolveAutoLearnProvider()
+		if strings.TrimSpace(autoProvider) != "" {
+			args = append(args, "--provider", autoProvider)
+		}
+		autoProfile := strings.TrimSpace(os.Getenv("VOICETYPE_AUTO_LEARN_ENCODE_PROFILE"))
+		if autoProfile == "" {
+			autoProfile = resolveAutoLearnProfile(autoProvider)
+		}
+		if autoProfile != "" {
+			args = append(args, "--encode-profile", autoProfile)
+		}
+		if getEnvBool("VOICETYPE_AUTO_LEARN_REFRESH_SAMPLES", false) {
+			args = append(args, "--refresh-samples")
+		}
+		if getEnvBool("VOICETYPE_AUTO_LEARN_AGGRESSIVE", false) {
+			args = append(args, "--aggressive-encode")
+		}
+
+		cmd := exec.Command("python3", args...)
+		cmd.Env = setEnvValue(os.Environ(), "TEXT_GENERATOR_API_KEY", config.APIKey)
+		if config.FalKey != "" {
+			cmd.Env = setEnvValue(cmd.Env, "FAL_KEY", config.FalKey)
+		}
+	if groqKey := getGroqKey(); strings.TrimSpace(groqKey) != "" {
+		cmd.Env = setEnvValue(cmd.Env, "GROQ_API_KEY", groqKey)
+	}
+
+		fmt.Printf("auto-learning: running %s\n", strings.Join(args, " "))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
+			}
+			fmt.Printf("auto-learning failed: %s\n", msg)
+			return
+		}
+		fmt.Printf("auto-learning completed (samples=%d, top=%d)\n", count, topSamples)
+	}()
+}
+
+func autoLearnLastSignatureEmpty(signature string) bool {
+	return strings.TrimSpace(signature) == ""
+}
+
 func startHotkeyListener() {
 	home, _ := os.UserHomeDir()
 	triggerFile := filepath.Join(home, ".cache", "voicetype-trigger")
@@ -138,8 +603,13 @@ func startHotkeyListener() {
 
 	for {
 		if _, err := os.Stat(triggerFile); err == nil {
-			os.Remove(triggerFile)
-			handleHotkey()
+			_ = withHotkeyLock(func() error {
+				if _, err2 := os.Stat(triggerFile); err2 == nil {
+					os.Remove(triggerFile)
+					handleHotkey()
+				}
+				return nil
+			})
 		}
 		time.Sleep(80 * time.Millisecond)
 	}
@@ -152,7 +622,7 @@ func handleHotkey() {
 	}
 	lastHotkeyTime = now
 
-	if recording {
+	if isRecording() {
 		stopRecording()
 	} else {
 		startRecording()
@@ -168,7 +638,11 @@ func getActiveWindow() string {
 }
 
 func startRecording() {
-	recording = true
+	if !setRecording(true) {
+		return
+	}
+
+	home, _ := os.UserHomeDir()
 	os.WriteFile(instanceRecordingFlag, []byte("1"), 0600)
 	chunkResults = make(map[int]string)
 
@@ -183,17 +657,11 @@ func startRecording() {
 	go showVisualizer()
 
 	// Start VAD chunker
-	locations := []string{
-		filepath.Join(filepath.Dir(os.Args[0]), "vad_chunker.py"),
-		"/usr/local/share/voicetype/vad_chunker.py",
-		filepath.Join(os.Getenv("HOME"), ".local/share/voicetype/vad_chunker.py"),
-	}
-	var scriptPath string
-	for _, loc := range locations {
-		if _, err := os.Stat(loc); err == nil {
-			scriptPath = loc
-			break
-		}
+	scriptPath := findScriptPath("vad_chunker.py")
+	if scriptPath != "" {
+		samplesDir := filepath.Join(filepath.Dir(scriptPath), "samples")
+		fmt.Printf("using VAD chunker: %s\n", scriptPath)
+		fmt.Printf("samples dir: %s\n", samplesDir)
 	}
 
 	if scriptPath != "" {
@@ -208,10 +676,10 @@ func startRecording() {
 	}
 
 	go func() {
-		for recording {
+		for isRecording() {
 			time.Sleep(100 * time.Millisecond)
 			if _, err := os.Stat("/tmp/voicetype-visualizer-run"); os.IsNotExist(err) {
-				if recording {
+				if isRecording() {
 					stopRecording()
 				}
 				return
@@ -223,7 +691,9 @@ func startRecording() {
 }
 
 func stopRecording() {
-	recording = false
+	if !setRecording(false) {
+		return
+	}
 	os.Remove(instanceRecordingFlag)
 
 	hideVisualizer()
@@ -287,13 +757,15 @@ func stopRecording() {
 		}
 		typeText(windowID, text)
 	}
+
+	go startAutoOptimization()
 }
 
 func watchChunks() {
 	readyPath := filepath.Join(chunkDir, "ready")
 	var lastPos int64 = 0
 
-	for recording {
+	for isRecording() {
 		time.Sleep(200 * time.Millisecond)
 
 		file, err := os.Open(readyPath)
@@ -527,62 +999,48 @@ func truncate(s string, n int) string {
 }
 
 func preloadLocalModel() {
-	localModelMu.Lock()
-	if localModelReady || localModelWarming {
-		localModelMu.Unlock()
-		return
-	}
-	localModelWarming = true
-	localModelMu.Unlock()
-
 	go func() {
-		ready := false
-
-		if _, err := localASRRequest("preload", ""); err == nil {
-			ready = true
-		} else {
-			serverScript := findScriptPath("model_server.py")
-			if serverScript != "" {
-				if isSocketStale(localModelSocket) {
-					os.Remove(localModelSocket)
-				}
-
-				exec.Command(nemoPythonPath, serverScript).Start()
-
-				deadline := time.Now().Add(18 * time.Second)
-				for time.Now().Before(deadline) {
-					if _, err := localASRRequest("preload", ""); err == nil {
-						ready = true
-						break
-					}
-					time.Sleep(250 * time.Millisecond)
-				}
+		_ = withModelLock(func() error {
+			if isLocalModelReady() {
+				return nil
 			}
-		}
-
-		localModelMu.Lock()
-		localModelReady = ready
-		localModelWarming = false
-		localModelMu.Unlock()
+			return ensureLocalModelReadyLocked()
+		})
 	}()
 }
 
-func waitForLocalModelReady(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		localModelMu.Lock()
-		ready := localModelReady
-		warming := localModelWarming
-		localModelMu.Unlock()
-
-		if ready {
-			return true
-		}
-		if !warming || time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(100 * time.Millisecond)
+func ensureLocalModelReadyLocked() error {
+	if _, err := localASRRequest("preload", ""); err == nil {
+		setLocalModelReady(true)
+		return nil
 	}
+
+	serverScript := findScriptPath("model_server.py")
+	if serverScript == "" {
+		setLocalModelReady(false)
+		return fmt.Errorf("model_server.py not found")
+	}
+	if isSocketStale(localModelSocket) {
+		os.Remove(localModelSocket)
+	}
+
+	cmd := exec.Command(nemoPythonPath, serverScript)
+	if err := cmd.Start(); err != nil {
+		setLocalModelReady(false)
+		return err
+	}
+
+	deadline := time.Now().Add(18 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := localASRRequest("preload", ""); err == nil {
+			setLocalModelReady(true)
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	setLocalModelReady(false)
+	return fmt.Errorf("local model never became ready")
 }
 
 func showVisualizer() {
@@ -737,21 +1195,25 @@ func transcribeAPI(audioPath string) string {
 
 func transcribeLocal(audioPath string) string {
 	preloadLocalModel()
-	if !waitForLocalModelReady(1500 * time.Millisecond) {
+	var text string
+	if err := withModelLock(func() error {
+		if !isLocalModelReady() {
+			if err := ensureLocalModelReadyLocked(); err != nil {
+				return err
+			}
+		}
+		var err error
+		text, err = localASRRequest("transcribe", audioPath)
+		if err != nil {
+			setLocalModelReady(false)
+			return err
+		}
+		text = strings.TrimSpace(text)
+		return nil
+	}); err != nil {
 		return ""
 	}
 
-	text, err := localASRRequest("transcribe", audioPath)
-	if err != nil {
-		localModelMu.Lock()
-		localModelReady = false
-		localModelMu.Unlock()
-
-		fmt.Println("Local ASR error:", err)
-		return ""
-	}
-
-	text = strings.TrimSpace(text)
 	if text == "" {
 		fmt.Println("Local ASR not available")
 		return ""
@@ -762,10 +1224,12 @@ func transcribeLocal(audioPath string) string {
 }
 
 func findScriptPath(name string) string {
+	home, _ := os.UserHomeDir()
 	locations := []string{
-		filepath.Join(filepath.Dir(os.Args[0]), name),
-		"/usr/local/share/voicetype/" + name,
+		filepath.Join(home, "code", "voicetype", name),
 		filepath.Join(os.Getenv("HOME"), ".local/share/voicetype", name),
+		"/usr/local/share/voicetype/" + name,
+		filepath.Join(filepath.Dir(os.Args[0]), name),
 	}
 
 	for _, loc := range locations {

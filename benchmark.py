@@ -1,189 +1,290 @@
 #!/usr/bin/env python3
-"""Record audio, check levels, and test transcription pipeline."""
-import subprocess
-import struct
-import sys
+"""End-to-end latency + WER benchmark for the live transcription path."""
+
+import argparse
+import json
 import os
+import struct
+import subprocess
 import time
+import tempfile
 import numpy as np
 
-SAMPLE_RATE = 16000
-DURATION = 5
-CHUNK_DIR = "/tmp/voicetype-chunks"
-OUT_WAV = "/tmp/voicetype-benchmark.wav"
-OUT_OGG = "/tmp/voicetype-benchmark.ogg"
+from wer_test import normalize_text, wer, compress_to_ogg as encode_audio_to_ogg, transcribe_with_provider
 
-def write_wav(path, samples, sr):
-    import struct
-    n = len(samples)
+SAMPLE_RATE = 16000
+OUT_DIR = tempfile.gettempdir()
+OUT_WAV = os.path.join(OUT_DIR, "voicetype-e2e-bench.wav")
+
+
+def write_wav(path: str, samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> None:
+    samples = np.clip(samples, -1.0, 1.0)
+    audio_int16 = (samples * 32767).astype(np.int16)
     with open(path, 'wb') as f:
         f.write(b'RIFF')
-        f.write(struct.pack('<I', 36 + n * 2))
+        f.write(struct.pack('<I', 36 + len(audio_int16) * 2))
         f.write(b'WAVE')
         f.write(b'fmt ')
-        f.write(struct.pack('<IHHIIHH', 16, 1, 1, sr, sr * 2, 2, 16))
+        f.write(struct.pack('<IHHIIHH', 16, 1, 1, sample_rate, sample_rate * 2, 2, 16))
         f.write(b'data')
-        f.write(struct.pack('<I', n * 2))
-        f.write(samples.tobytes())
+        f.write(struct.pack('<I', len(audio_int16) * 2))
+        f.write(audio_int16.tobytes())
 
-def record(duration):
-    print(f"Recording {duration}s... speak now")
+
+def record(seconds: float) -> np.ndarray:
+    print(f"Recording {seconds:.1f}s ...")
     proc = subprocess.Popen(
         ['parec', '--raw', '--format=s16le', f'--rate={SAMPLE_RATE}', '--channels=1'],
-        stdout=subprocess.PIPE
+        stdout=subprocess.PIPE,
     )
     frames = []
-    total = SAMPLE_RATE * duration * 2
-    read = 0
-    while read < total:
-        chunk = proc.stdout.read(min(4096, total - read))
+    target = int(SAMPLE_RATE * seconds * 2)
+    got = 0
+    while got < target:
+        chunk = proc.stdout.read(min(4096, target - got))
         if not chunk:
             break
         frames.append(chunk)
-        read += len(chunk)
+        got += len(chunk)
+
     proc.terminate()
     proc.wait()
     raw = b''.join(frames)
-    return np.frombuffer(raw, dtype=np.int16)
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-def analyze(samples):
+
+def analyze(samples: np.ndarray) -> str:
+    if len(samples) == 0:
+        return "silent"
     f32 = samples.astype(np.float32) / 32768.0
-    peak = np.max(np.abs(f32))
-    rms = np.sqrt(np.mean(f32 ** 2))
-    silent_frames = np.sum(np.abs(f32) < 0.01) / len(f32) * 100
-    print(f"  peak: {peak:.4f}")
-    print(f"  rms:  {rms:.4f}")
-    print(f"  silent: {silent_frames:.1f}%")
-    if peak < 0.01:
-        print("  WARNING: no audio detected - mic may not be working")
-    elif peak < 0.05:
-        print("  WARNING: very low audio levels")
-    return peak > 0.01
+    peak = float(np.max(np.abs(f32)))
+    rms = float(np.sqrt(np.mean(f32 ** 2)))
+    ratio = (np.abs(f32) < 0.01).sum() / float(len(f32)) * 100.0
+    return f"duration={len(samples)/SAMPLE_RATE:.2f}s peak={peak:.4f} rms={rms:.4f} silence={ratio:.1f}%"
 
-def get_api_key():
-    key = os.environ.get('TEXT_GENERATOR_API_KEY', '')
-    if not key:
-        env_file = os.path.expanduser('~/.config/voicetype/env')
-        if os.path.exists(env_file):
-            for line in open(env_file):
-                line = line.strip()
-                if line.startswith('TEXT_GENERATOR_API_KEY='):
-                    key = line.split('=', 1)[1].strip().strip('"').strip("'")
-    return key
 
-def transcribe_api(ogg_path):
-    import json
-    key = get_api_key()
-    if not key:
-        print("  no API key found")
-        return ""
+def basic_normalize(audio_f32: np.ndarray) -> np.ndarray:
+    peak = float(np.max(np.abs(audio_f32)))
+    if peak < 0.005:
+        return audio_f32
+    return np.clip(audio_f32 * (0.9 / peak), -1.0, 1.0)
 
-    result = subprocess.run([
-        'curl', '-s',
-        '-X', 'POST',
-        'https://api.text-generator.io/api/v1/audio-file-extraction',
-        '-H', f'secret: {key}',
-        '-F', f'audio_file=@{ogg_path}',
-        '-F', 'translate_to_english=false',
-    ], capture_output=True, text=True, timeout=60)
 
+def preprocess_audio(audio_f32: np.ndarray) -> np.ndarray:
     try:
-        data = json.loads(result.stdout)
-        return data.get('text', '')
-    except Exception as e:
-        print(f"  API error: {e} | {result.stdout[:200]}")
-        return ""
+        from audio_preprocess import AudioPreprocessor
+        pre = AudioPreprocessor()
+        if pre.enabled:
+            return pre.process(audio_f32.copy())
+    except Exception:
+        pass
+    return basic_normalize(audio_f32)
+
+
+def run_variant(audio_f32: np.ndarray, label: str, do_preprocess=True, aggressive=False, provider="auto", encode_profile=None):
+    timings = {}
+
+    t0 = time.time()
+    if do_preprocess:
+        processed = preprocess_audio(audio_f32)
+    else:
+        processed = basic_normalize(audio_f32)
+    timings['preprocess_s'] = time.time() - t0
+
+    t0 = time.time()
+    ogg = encode_audio_to_ogg(
+        processed,
+        aggressive=aggressive,
+        provider=provider,
+        profile=encode_profile,
+    )
+    timings['encode_s'] = time.time() - t0
+
+    t0 = time.time()
+    text = transcribe_with_provider(ogg, provider=provider)
+    timings['transcribe_s'] = time.time() - t0
+
+    size = os.path.getsize(ogg) if os.path.exists(ogg) else 0
+    try:
+        os.remove(ogg)
+    except Exception:
+        pass
+    return text, size, timings
+
+
+def run_optimize(top_samples, budget, refresh, aggressive_encode, min_samples, provider="auto", encode_profile=None):
+    optimize_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'optimize.py')
+    if not os.path.exists(optimize_script):
+        return False, 'optimize.py not found'
+
+    cmd = [
+        'python3', optimize_script,
+        '--use-real-samples',
+        '--top-samples', str(top_samples),
+        '--budget', str(budget),
+    ]
+    if provider:
+        cmd.extend(['--provider', provider])
+    if encode_profile:
+        cmd.extend(['--encode-profile', encode_profile])
+    if refresh:
+        cmd.append('--refresh-samples')
+    if aggressive_encode:
+        cmd.append('--aggressive-encode')
+
+    if min_samples is not None:
+        env = os.environ.copy()
+        env['VOICETYPE_AUTO_LEARN_MIN_SAMPLES'] = str(min_samples)
+    else:
+        env = None
+
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    out = (p.stdout or '') + '\n' + (p.stderr or '')
+    if p.returncode != 0:
+        return False, out.strip()
+
+    return True, out.strip()
+
 
 def main():
-    dur = int(sys.argv[1]) if len(sys.argv) > 1 else DURATION
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seconds', type=float, default=6.0)
+    parser.add_argument('--iterations', type=int, default=1)
+    parser.add_argument('--aggressive', action='store_true', help='use silence trim + atempo in encode path')
+    parser.add_argument('--reference', default='', help='ground truth text for WER check')
+    parser.add_argument('--optimize', action='store_true', help='run optimize.py after benchmark using real samples')
+    parser.add_argument('--optimize-iterations', type=int, default=1, help='repeat optimization passes')
+    parser.add_argument('--optimize-budget', type=int, default=90)
+    parser.add_argument('--optimize-top', type=int, default=10)
+    parser.add_argument('--optimize-refresh', action='store_true', help='refresh sample GT each optimization run')
+    parser.add_argument('--optimize-aggressive', action='store_true', help='optimize with aggressive encoding')
+    parser.add_argument('--optimize-min-samples', type=int, default=10)
+    parser.add_argument('--provider', default='auto', help='provider for benchmark and optimize run: auto|groq|fal')
+    parser.add_argument('--encode-profile', default=None, help='encoder profile to test')
+    args = parser.parse_args()
 
-    # list audio sources
-    print("=== PulseAudio sources ===")
+    print('=== PulseAudio sources ===')
     subprocess.run(['pactl', 'list', 'short', 'sources'])
     print()
-    print(f"=== Default source ===")
-    subprocess.run(['pactl', 'get-default-source'])
-    print()
 
-    # record
-    print(f"=== Recording ({dur}s) ===")
-    samples = record(dur)
-    print(f"  captured {len(samples)} samples ({len(samples)/SAMPLE_RATE:.1f}s)")
-
-    # analyze
-    print("=== Audio levels ===")
-    has_audio = analyze(samples)
-
-    # save
-    write_wav(OUT_WAV, samples, SAMPLE_RATE)
-    print(f"  saved: {OUT_WAV}")
-
-    # compress
-    subprocess.run([
-        'ffmpeg', '-y', '-i', OUT_WAV,
-        '-ac', '1', '-ar', '16000',
-        '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip',
-        OUT_OGG
-    ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    ogg_size = os.path.getsize(OUT_OGG)
-    print(f"  compressed: {OUT_OGG} ({ogg_size} bytes)")
-
-    # normalize
-    print("\n=== Normalized ===")
-    f32 = samples.astype(np.float32) / 32768.0
-    peak = np.max(np.abs(f32))
-    if peak > 0.005:
-        gain = 0.9 / peak
-        normalized = np.clip(f32 * gain, -1.0, 1.0)
-        norm_int16 = (normalized * 32767).astype(np.int16)
-        norm_wav = "/tmp/voicetype-benchmark-norm.wav"
-        write_wav(norm_wav, norm_int16, SAMPLE_RATE)
-        norm_peak = np.max(np.abs(normalized))
-        norm_rms = np.sqrt(np.mean(normalized ** 2))
-        print(f"  gain: {gain:.1f}x")
-        print(f"  peak: {norm_peak:.4f}")
-        print(f"  rms:  {norm_rms:.4f}")
-
-        # compress normalized with silence removal
-        norm_ogg = "/tmp/voicetype-benchmark-norm.ogg"
-        subprocess.run([
-            'ffmpeg', '-y', '-i', norm_wav,
-            '-af', 'silenceremove=start_periods=1:start_silence=0.1:start_threshold=-40dB,'
-                   'areverse,silenceremove=start_periods=1:start_silence=0.1:start_threshold=-40dB,'
-                   'areverse,atempo=1.3',
-            '-ac', '1', '-ar', '16000',
-            '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip',
-            norm_ogg
-        ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        norm_size = os.path.getsize(norm_ogg)
-        print(f"  compressed: {norm_ogg} ({norm_size} bytes vs {ogg_size} raw)")
+    ref = args.reference.strip()
+    if ref:
+        print(f'=== Reference WER enabled ===')
+        print(f"  reference: {ref}")
     else:
-        norm_ogg = OUT_OGG
+        print('=== Reference WER disabled (no --reference provided) ===')
 
-    if not has_audio:
-        print("\nNo audio detected, skipping transcription test")
-        print("Check: pactl get-default-source")
-        return
+    rows = []
 
-    # transcribe both
-    print("\n=== Transcription (raw) ===")
-    t0 = time.time()
-    text = transcribe_api(OUT_OGG)
-    elapsed = time.time() - t0
-    print(f"  result: {text}")
-    print(f"  time: {elapsed:.2f}s")
+    for i in range(max(1, args.iterations)):
+        print(f"\n=== Iteration {i + 1}/{args.iterations} ===")
+        t0 = time.time()
+        samples = record(args.seconds)
+        capture_s = time.time() - t0
+        print(f"capture: {capture_s:.3f}s | {analyze(samples)}")
 
-    print("\n=== Transcription (normalized + trimmed) ===")
-    t0 = time.time()
-    text2 = transcribe_api(norm_ogg)
-    elapsed2 = time.time() - t0
-    print(f"  result: {text2}")
-    print(f"  time: {elapsed2:.2f}s")
+        if len(samples) == 0:
+            print('No audio captured. aborting this iteration')
+            continue
 
-    # playback
-    print("\n=== Playback ===")
-    subprocess.run(['paplay', '--raw', f'--rate={SAMPLE_RATE}', '--format=s16le', '--channels=1', OUT_WAV.replace('.wav', '_raw')], timeout=dur+2) if False else None
-    print("done")
+        write_wav(OUT_WAV, samples, SAMPLE_RATE)
+
+        baseline_text, baseline_bytes, baseline_t = run_variant(
+            samples,
+            f'base_{i}',
+            do_preprocess=False,
+            aggressive=False,
+            provider=args.provider,
+            encode_profile=args.encode_profile,
+        )
+        pipe_text, pipe_bytes, pipe_t = run_variant(
+            samples,
+            f'pipe_{i}',
+            do_preprocess=True,
+            aggressive=args.aggressive,
+            provider=args.provider,
+            encode_profile=args.encode_profile,
+        )
+
+        baseline_wer = wer(normalize_text(ref), normalize_text(baseline_text)) if ref else None
+        pipe_wer = wer(normalize_text(ref), normalize_text(pipe_text)) if ref else None
+
+        print(f"  baseline(raw): {baseline_text}")
+        print(f"  pipeline : {pipe_text}")
+
+        t_tot = {
+            **{f'base_{k}': v for k, v in baseline_t.items()},
+            **{f'pipe_{k}': v for k, v in pipe_t.items()},
+            'capture_s': capture_s,
+        }
+
+        print(f"  baseline preprocess={t_tot['base_preprocess_s']:.3f}s encode={t_tot['base_encode_s']:.3f}s transcribe={t_tot['base_transcribe_s']:.3f}s size={baseline_bytes} bytes")
+        print(f"  pipeline preprocess={t_tot['pipe_preprocess_s']:.3f}s encode={t_tot['pipe_encode_s']:.3f}s transcribe={t_tot['pipe_transcribe_s']:.3f}s size={pipe_bytes} bytes")
+
+        if ref:
+            print(f"  WER baseline:  {baseline_wer:.4f}")
+            print(f"  WER pipeline: {pipe_wer:.4f}")
+
+        rows.append({
+            'capture_s': capture_s,
+            'baseline': baseline_t,
+            'pipeline': pipe_t,
+            'bytes': {'baseline': baseline_bytes, 'pipeline': pipe_bytes},
+            'wer': {'baseline': baseline_wer, 'pipeline': pipe_wer},
+        })
+
+    print('\n=== summary ===')
+    if rows:
+        cap = np.mean([r['capture_s'] for r in rows])
+        bprep = np.mean([r['baseline']['preprocess_s'] for r in rows])
+        ben = np.mean([r['baseline']['encode_s'] for r in rows])
+        bt = np.mean([r['baseline']['transcribe_s'] for r in rows])
+        pprep = np.mean([r['pipeline']['preprocess_s'] for r in rows])
+        pen = np.mean([r['pipeline']['encode_s'] for r in rows])
+        pt = np.mean([r['pipeline']['transcribe_s'] for r in rows])
+        print(f'capture:  {cap:.3f}s')
+        print(f'baseline: preprocess={bprep:.3f}s encode={ben:.3f}s transcribe={bt:.3f}s')
+        print(f'pipeline: preprocess={pprep:.3f}s encode={pen:.3f}s transcribe={pt:.3f}s')
+
+        if args.reference:
+            base_wer = [r['wer']['baseline'] for r in rows if r['wer']['baseline'] is not None]
+            pipe_wer = [r['wer']['pipeline'] for r in rows if r['wer']['pipeline'] is not None]
+            if base_wer:
+                print(f'WER baseline avg: {np.mean(base_wer):.4f}')
+            if pipe_wer:
+                print(f'WER pipeline avg: {np.mean(pipe_wer):.4f}')
+
+    if args.optimize:
+        print('\n=== auto optimize on captured samples ===')
+        rounds = max(1, args.optimize_iterations)
+        for i in range(rounds):
+            if rounds > 1:
+                print(f"\n  optimize round {i + 1}/{rounds}")
+
+            ok, out = run_optimize(
+                top_samples=args.optimize_top,
+                budget=args.optimize_budget,
+                refresh=args.optimize_refresh,
+                aggressive_encode=args.optimize_aggressive,
+                min_samples=args.optimize_min_samples,
+                provider=args.provider,
+                encode_profile=args.encode_profile,
+            )
+            if not ok:
+                print(f'optimize failed: {out[:400]}')
+                break
+
+            params_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'optimized_params.json')
+            if os.path.exists(params_path):
+                try:
+                    with open(params_path) as f:
+                        data = json.load(f)
+                    print('  optimize completed')
+                    print(f"  optimized WER (last run): {data.get('wer', '?')}")
+                    print(f"  optimized baseline WER: {data.get('baseline_wer', '?')}")
+                except Exception as e:
+                    print(f'  could not parse optimized params: {e}')
+
 
 if __name__ == '__main__':
     main()
