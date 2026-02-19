@@ -16,9 +16,15 @@ Set your [text-generator.io](https://text-generator.io) API key:
 echo 'TEXT_GENERATOR_API_KEY=your_key_here' >> ~/.config/voicetype/env
 ```
 
+If you have Groq credentials, add it for primary transcription:
+
+```bash
+echo 'GROQ_API_KEY=your_groq_key_here' >> ~/.config/voicetype/env
+```
+
 ### Fallback ASR (optional)
 
-VoiceType prefers local ASR when available. If local inference is unavailable or fails, it falls back to text-generator API, then [fal.ai Whisper](https://fal.ai/models/fal-ai/whisper). Set your fal key:
+Transcription order is: Groq → text-generator → [fal.ai Whisper](https://fal.ai/models/fal-ai/whisper) → local ASR. Set your fal key:
 
 ```bash
 echo 'FAL_KEY=your_fal_key' >> ~/.config/voicetype/env

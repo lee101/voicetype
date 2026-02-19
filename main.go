@@ -642,7 +642,6 @@ func startRecording() {
 		return
 	}
 
-	home, _ := os.UserHomeDir()
 	os.WriteFile(instanceRecordingFlag, []byte("1"), 0600)
 	chunkResults = make(map[int]string)
 
@@ -831,51 +830,55 @@ func uploadChunk(path string, index int) {
 }
 
 func transcribeChunk(processedPath string, rawPath string) string {
+	// Groq first
+	groqText := transcribeGroq(processedPath)
+	if groqText == "" && rawPath != processedPath {
+		if _, err := os.Stat(rawPath); err == nil {
+			if rt := transcribeGroq(rawPath); betterText(rt, groqText) {
+				groqText = rt
+			}
+		}
+	}
+	if groqText != "" {
+		return groqText
+	}
+
+	// text-generator fallback
+	textAPI := transcribeChunkAPI(processedPath)
+	if textAPI == "" && rawPath != processedPath {
+		if _, err := os.Stat(rawPath); err == nil {
+			if rt := transcribeChunkAPI(rawPath); betterText(rt, textAPI) {
+				textAPI = rt
+			}
+		}
+	}
+	if textAPI != "" {
+		return textAPI
+	}
+
+	// fal fallback
+	falText := transcribeFal(processedPath)
+	if falText == "" && rawPath != processedPath {
+		if _, err := os.Stat(rawPath); err == nil {
+			if rt := transcribeFal(rawPath); betterText(rt, falText) {
+				falText = rt
+			}
+		}
+	}
+	if falText != "" {
+		return falText
+	}
+
+	// local fallback
 	localText := transcribeLocal(processedPath)
 	if localText == "" && rawPath != processedPath {
 		if _, err := os.Stat(rawPath); err == nil {
-			if t := transcribeLocal(rawPath); betterText(t, localText) {
-				localText = t
+			if rt := transcribeLocal(rawPath); betterText(rt, localText) {
+				localText = rt
 			}
 		}
 	}
-	if localText != "" {
-		return localText
-	}
-
-	fmt.Println("Local ASR empty, racing API + fal...")
-	result := make(chan string, 2)
-
-	go func() {
-		t := transcribeChunkAPI(processedPath)
-		if t == "" && rawPath != processedPath {
-			if _, err := os.Stat(rawPath); err == nil {
-				if rt := transcribeChunkAPI(rawPath); betterText(rt, t) {
-					t = rt
-				}
-			}
-		}
-		result <- t
-	}()
-
-	go func() {
-		t := transcribeFal(processedPath)
-		if t == "" && rawPath != processedPath {
-			if _, err := os.Stat(rawPath); err == nil {
-				if rt := transcribeFal(rawPath); betterText(rt, t) {
-					t = rt
-				}
-			}
-		}
-		result <- t
-	}()
-
-	for i := 0; i < 2; i++ {
-		if t := <-result; t != "" {
-			return t
-		}
-	}
-	return ""
+	return localText
 }
 
 func betterText(a string, b string) bool {
@@ -888,6 +891,71 @@ func betterText(a string, b string) bool {
 		return true
 	}
 	return len(a) > len(b)+4
+}
+
+func transcribeGroq(audioPath string) string {
+	key := getGroqKey()
+	if strings.TrimSpace(key) == "" {
+		return ""
+	}
+
+	file, err := os.Open(audioPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", filepath.Base(audioPath))
+	if _, err := io.Copy(part, file); err != nil {
+		return ""
+	}
+	writer.WriteField("model", "whisper-large-v3-turbo")
+	if err := writer.Close(); err != nil {
+		return ""
+	}
+
+	req, _ := http.NewRequest("POST", "https://api.groq.com/openai/v1/audio/transcriptions", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	client := &http.Client{Timeout: 45 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		if len(body) > 0 {
+			fmt.Println("Groq API error:", strings.TrimSpace(string(body)))
+		}
+		return ""
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	var result APIResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		type groqResponse struct {
+			Text string `json:"text"`
+		}
+		var r groqResponse
+		if err2 := json.Unmarshal(body, &r); err2 != nil {
+			return ""
+		}
+		result.Text = r.Text
+	}
+
+	if result.Text == "" {
+		return ""
+	}
+	fmt.Println("Groq transcribed:", truncate(result.Text, 50))
+	return result.Text
 }
 
 func transcribeChunkAPI(audioPath string) string {
@@ -1110,7 +1178,7 @@ func wasCancelled() bool {
 }
 
 func transcribeAudio(audioPath string) string {
-	text := transcribeLocal(audioPath)
+	text := transcribeGroq(audioPath)
 	if text != "" {
 		return text
 	}
@@ -1125,7 +1193,9 @@ func transcribeAudio(audioPath string) string {
 	if text != "" {
 		return text
 	}
-	return ""
+
+	fmt.Println("Fal failed, trying local Parakeet...")
+	return transcribeLocal(audioPath)
 }
 
 func transcribeAPI(audioPath string) string {
