@@ -45,8 +45,16 @@ class WaveformVisualizer(Gtk.Window):
     def start_audio_monitor(self):
         def monitor():
             try:
+                cmd = ['parec', '--raw', '--format=s16le', '--rate=8000', '--channels=1']
+                try:
+                    with open('/tmp/voicetype-audio-source') as f:
+                        src = f.read().strip()
+                    if src:
+                        cmd.append(f'--device={src}')
+                except FileNotFoundError:
+                    pass
                 proc = subprocess.Popen(
-                    ['parec', '--raw', '--format=s16le', '--rate=8000', '--channels=1'],
+                    cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL
                 )

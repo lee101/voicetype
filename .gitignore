@@ -1,3 +1,9 @@
 voicetype
 *.wav
 env
+samples/
+optimization_cache.json
+wer_history.json
+wer_results.json
+optimized_params.json
+test_audio/ground_truth.json

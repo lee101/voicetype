@@ -15,8 +15,89 @@ TARGET_CHUNK_S = 60.0
 MIN_CHUNK_S = 50.0
 MAX_CHUNK_S = 70.0
 SILENCE_THRESHOLD_S = 0.3  # min silence to split
+TARGET_PEAK = 0.9
+NOISE_GATE = 0.005
 
 CHUNK_DIR = "/tmp/voicetype-chunks"
+SAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'samples')
+ROLLING_DIR = os.path.join(SAMPLES_DIR, 'rolling')
+UTTERANCE_DIR = os.path.join(SAMPLES_DIR, 'utterances')
+MAX_SAVED_SAMPLES = 5
+ROLLING_DURATION_S = 8.0
+ROLLING_MAX = 10
+UTTERANCE_MAX = 20
+MIN_UTTERANCE_S = 0.5
+
+
+def env_true(name, default=False):
+    v = os.getenv(name, "").strip().lower()
+    if not v:
+        return default
+    return v in {"1", "true", "yes", "on", "y"}
+
+
+AGGRESSIVE_ENCODER = env_true("VOICETYPE_AGGRESSIVE_ENCODER")
+FORCE_DISABLE_VAD = env_true("VOICETYPE_DISABLE_VAD")
+FORCE_NO_PREPROCESS = env_true("VOICETYPE_DISABLE_PREPROCESS")
+SAVE_RAW_CHUNKS = env_true("VOICETYPE_SAVE_RAW_CHUNK", True)
+
+
+def detect_best_source():
+    """Probe each PulseAudio input source briefly, return the one with highest signal."""
+    try:
+        result = subprocess.run(
+            ['pactl', 'list', 'short', 'sources'],
+            capture_output=True, text=True, timeout=5
+        )
+    except Exception:
+        return None
+
+    sources = []
+    for line in result.stdout.strip().split('\n'):
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+        name = parts[1]
+        # skip monitor sources (output loopback)
+        if '.monitor' in name:
+            continue
+        sources.append(name)
+
+    if not sources:
+        return None
+
+    best_source = None
+    best_peak = -1.0
+
+    for src in sources:
+        try:
+            proc = subprocess.Popen(
+                ['parec', '--raw', '--format=s16le', '--rate=16000', '--channels=1',
+                 f'--device={src}'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            raw = proc.stdout.read(SAMPLE_RATE * 2)  # 0.5s probe
+            proc.terminate()
+            proc.wait(timeout=2)
+
+            if raw:
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                peak = float(np.max(np.abs(samples)))
+                rms = float(np.sqrt(np.mean(samples ** 2)))
+                print(f"  source {src}: peak={peak:.4f} rms={rms:.4f}", file=sys.stderr)
+                if peak > best_peak:
+                    best_peak = peak
+                    best_source = src
+        except Exception as e:
+            print(f"  source {src}: probe failed: {e}", file=sys.stderr)
+            continue
+
+    if best_source and best_peak > 0.005:
+        print(f"  selected: {best_source} (peak={best_peak:.4f})", file=sys.stderr)
+        return best_source
+
+    print("  no good source found, using default", file=sys.stderr)
+    return None
 
 class VADChunker:
     def __init__(self):
@@ -26,8 +107,44 @@ class VADChunker:
         self.chunk_num = 0
         self.model = None
         self.use_vad = True
+        self.preprocessor = None
+        self.force_preprocess = not FORCE_NO_PREPROCESS
+        self.sample_counter = 0
+        # rolling capture
+        self.rolling_buf = []
+        self.rolling_duration = 0.0
+        self.rolling_counter = 0
+        # per-utterance capture
+        self.in_utterance = False
+        self.utterance_buf = []
+        self.utterance_duration = 0.0
+        self.utt_silence = 0.0
+        self.utterance_counter = 0
+        self.apply_silence_filter = AGGRESSIVE_ENCODER
+        self.apply_atempo = AGGRESSIVE_ENCODER
+        os.makedirs(SAMPLES_DIR, exist_ok=True)
+        os.makedirs(ROLLING_DIR, exist_ok=True)
+        os.makedirs(UTTERANCE_DIR, exist_ok=True)
+
+    def load_preprocessor(self):
+        if not self.force_preprocess:
+            print("preprocessor disabled via VOICETYPE_DISABLE_PREPROCESS", file=sys.stderr)
+            return
+        try:
+            from audio_preprocess import AudioPreprocessor
+            self.preprocessor = AudioPreprocessor()
+            if self.preprocessor.enabled:
+                print("audio preprocessor loaded", file=sys.stderr)
+            else:
+                print("preprocessor: no ref stats, using basic normalize", file=sys.stderr)
+        except Exception as e:
+            print(f"preprocessor load failed: {e}", file=sys.stderr)
 
     def load_model(self):
+        if FORCE_DISABLE_VAD:
+            print("VAD disabled via VOICETYPE_DISABLE_VAD, using time-based chunking", file=sys.stderr)
+            self.use_vad = False
+            return
         try:
             import torch
             torch.set_num_threads(1)
@@ -50,10 +167,104 @@ class VADChunker:
         prob = self.model(audio, SAMPLE_RATE).item()
         return prob > 0.5
 
+    def _save_audio_bg(self, audio_f32, path):
+        import threading
+        def _save():
+            wav_path = path.replace('.ogg', '.wav')
+            try:
+                audio_int16 = (audio_f32 * 32767).astype(np.int16)
+                with open(wav_path, 'wb') as f:
+                    write_wav_header(f, len(audio_int16), SAMPLE_RATE)
+                    f.write(audio_int16.tobytes())
+                subprocess.run([
+                    'ffmpeg', '-y', '-i', wav_path,
+                    '-ac', '1', '-ar', '16000',
+                    '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip',
+                    path
+                ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                os.remove(wav_path)
+            except Exception as e:
+                print(f"save failed {path}: {e}", file=sys.stderr)
+        threading.Thread(target=_save, daemon=True).start()
+
+    def _save_rolling(self, audio_f32):
+        idx = self.rolling_counter % ROLLING_MAX
+        self.rolling_counter += 1
+        path = os.path.join(ROLLING_DIR, f"rolling_{idx}.ogg")
+        peak = float(np.max(np.abs(audio_f32)))
+        rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
+        print(f"rolling_{idx} peak={peak:.3f} rms={rms:.3f}", file=sys.stderr)
+        self._save_audio_bg(audio_f32, path)
+
+    def _save_raw_chunk(self, audio_f32):
+        if not SAVE_RAW_CHUNKS:
+            return None
+
+        raw_wav = os.path.join(CHUNK_DIR, f"chunk-{self.chunk_num}.raw.wav")
+        raw_ogg = os.path.join(CHUNK_DIR, f"chunk-{self.chunk_num}.raw.ogg")
+        try:
+            audio_int16 = (audio_f32 * 32767).astype(np.int16)
+            with open(raw_wav, 'wb') as f:
+                write_wav_header(f, len(audio_int16), SAMPLE_RATE)
+                f.write(audio_int16.tobytes())
+
+            subprocess.run([
+                'ffmpeg', '-y', '-i', raw_wav,
+                '-ac', '1', '-ar', '16000',
+                '-c:a', 'libopus', '-b:a', '16k', '-application', 'voip',
+                '-vbr', 'on', '-compression_level', '10',
+                raw_ogg
+            ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            os.remove(raw_wav)
+            return raw_ogg
+        except Exception as e:
+            print(f"save raw chunk failed for {raw_ogg}: {e}", file=sys.stderr)
+            try:
+                os.remove(raw_wav)
+            except Exception:
+                pass
+            return None
+
+    def _save_utterance(self, audio_f32):
+        idx = self.utterance_counter % UTTERANCE_MAX
+        self.utterance_counter += 1
+        path = os.path.join(UTTERANCE_DIR, f"utterance_{idx}.ogg")
+        dur = len(audio_f32) / SAMPLE_RATE
+        peak = float(np.max(np.abs(audio_f32)))
+        print(f"utterance_{idx} {dur:.1f}s peak={peak:.3f}", file=sys.stderr)
+        self._save_audio_bg(audio_f32, path)
+
     def process_frame(self, raw_bytes):
         samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         is_speech = self.is_speech(samples)
 
+        # rolling capture (unconditional)
+        self.rolling_buf.extend(samples)
+        self.rolling_duration += FRAME_MS / 1000.0
+        if self.rolling_duration >= ROLLING_DURATION_S:
+            self._save_rolling(np.array(self.rolling_buf, dtype=np.float32))
+            self.rolling_buf = []
+            self.rolling_duration = 0.0
+
+        # per-utterance capture
+        if is_speech:
+            if not self.in_utterance:
+                self.in_utterance = True
+                self.utterance_buf = []
+                self.utterance_duration = 0.0
+            self.utterance_buf.extend(samples)
+            self.utterance_duration += FRAME_MS / 1000.0
+            self.utt_silence = 0.0
+        else:
+            if self.in_utterance:
+                self.utt_silence += FRAME_MS / 1000.0
+                self.utterance_buf.extend(samples)
+                if self.utt_silence >= SILENCE_THRESHOLD_S:
+                    if self.utterance_duration >= MIN_UTTERANCE_S:
+                        self._save_utterance(np.array(self.utterance_buf, dtype=np.float32))
+                    self.in_utterance = False
+
+        # existing chunk logic
         if is_speech:
             self.buffer.extend(samples)
             self.speech_duration += FRAME_MS / 1000.0
@@ -61,7 +272,7 @@ class VADChunker:
         else:
             self.silence_duration += FRAME_MS / 1000.0
             if self.speech_duration > 0:
-                self.buffer.extend(samples)  # keep some trailing silence
+                self.buffer.extend(samples)
 
         if self.should_emit():
             self.emit_chunk()
@@ -75,30 +286,98 @@ class VADChunker:
             return True
         return False
 
+    def save_sample(self, audio_f32):
+        """Save rolling window of last N samples to disk."""
+        idx = self.sample_counter % MAX_SAVED_SAMPLES
+        self.sample_counter += 1
+        ogg_path = os.path.join(SAMPLES_DIR, f"sample_{idx}.ogg")
+        wav_path = os.path.join(SAMPLES_DIR, f"sample_{idx}.wav")
+        try:
+            audio_int16 = (audio_f32 * 32767).astype(np.int16)
+            with open(wav_path, 'wb') as f:
+                write_wav_header(f, len(audio_int16), SAMPLE_RATE)
+                f.write(audio_int16.tobytes())
+            subprocess.run([
+                'ffmpeg', '-y', '-i', wav_path,
+                '-ac', '1', '-ar', '16000',
+                '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip',
+                ogg_path
+            ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            os.remove(wav_path)
+            peak = float(np.max(np.abs(audio_f32)))
+            rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
+            print(f"saved sample_{idx}.ogg peak={peak:.3f} rms={rms:.3f}", file=sys.stderr)
+        except Exception as e:
+            print(f"sample save failed: {e}", file=sys.stderr)
+
     def emit_chunk(self):
-        if len(self.buffer) < SAMPLE_RATE:  # skip tiny chunks
+        if len(self.buffer) < SAMPLE_RATE:
             return
 
         audio = np.array(self.buffer, dtype=np.float32)
+
+        # save raw sample before processing
+        self.save_sample(audio)
+        self._save_raw_chunk(audio)
+
+        # apply learned preprocessor or basic normalization
+        if self.preprocessor and self.force_preprocess:
+            audio = self.preprocessor.process(audio)
+        else:
+            peak = np.max(np.abs(audio))
+            if peak > NOISE_GATE:
+                audio = audio * (TARGET_PEAK / peak)
+
+        audio = np.clip(audio, -1.0, 1.0)
         audio_int16 = (audio * 32767).astype(np.int16)
 
         wav_path = os.path.join(CHUNK_DIR, f"chunk-{self.chunk_num}.wav")
         ogg_path = os.path.join(CHUNK_DIR, f"chunk-{self.chunk_num}.ogg")
 
-        # write wav
         with open(wav_path, 'wb') as f:
             write_wav_header(f, len(audio_int16), SAMPLE_RATE)
             f.write(audio_int16.tobytes())
 
-        # compress to opus with 1.3x speedup for faster transfer
-        subprocess.run([
-            'ffmpeg', '-y', '-i', wav_path,
-            '-af', 'atempo=1.3',
+        # compress to opus (optional silence filter + speedup)
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-i', wav_path
+        ]
+        if self.apply_silence_filter or self.apply_atempo:
+            filters = []
+            if self.apply_silence_filter:
+                filters.extend([
+                    'silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB',
+                    'areverse',
+                    'silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB',
+                    'areverse',
+                ])
+            if self.apply_atempo:
+                filters.append('atempo=1.3')
+            ffmpeg_cmd += ['-af', ','.join(filters)]
+
+        ffmpeg_cmd += [
             '-ac', '1', '-ar', '16000',
             '-c:a', 'libopus', '-b:a', '16k', '-application', 'voip',
             '-vbr', 'on', '-compression_level', '10',
             ogg_path
-        ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        ]
+        subprocess.run(ffmpeg_cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+        # if silence removal ate everything, retry without it
+        if not os.path.exists(ogg_path) or os.path.getsize(ogg_path) < 100:
+            print(f"chunk {self.chunk_num}: encoded audio too small, retrying plain", file=sys.stderr)
+            retry_cmd = [
+                'ffmpeg', '-y', '-i', wav_path
+            ]
+            if self.apply_atempo:
+                retry_cmd += ['-af', 'atempo=1.3']
+            retry_cmd += [
+                '-ac', '1', '-ar', '16000',
+                '-c:a', 'libopus', '-b:a', '16k', '-application', 'voip',
+                '-vbr', 'on', '-compression_level', '10',
+                ogg_path
+            ]
+            subprocess.run(retry_cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         os.remove(wav_path)
 
         # signal ready
@@ -140,18 +419,59 @@ def write_wav_header(f, num_samples, sample_rate):
     f.write(b'data')
     f.write(struct.pack('<I', data_size))
 
+def get_cached_source():
+    source_file = '/tmp/voicetype-audio-source'
+    try:
+        with open(source_file) as f:
+            src = f.read().strip()
+        if src:
+            return src
+    except Exception:
+        pass
+    return None
+
+
+def update_source_cache():
+    source = detect_best_source()
+    source_file = '/tmp/voicetype-audio-source'
+    if source:
+        with open(source_file, 'w') as f:
+            f.write(source)
+
+
 def main():
+    import threading
     os.makedirs(CHUNK_DIR, exist_ok=True)
     for f in os.listdir(CHUNK_DIR):
         os.remove(os.path.join(CHUNK_DIR, f))
 
-    chunker = VADChunker()
-    chunker.load_model()
+    # use cached source for instant startup
+    source = get_cached_source()
+    if source:
+        print(f"using cached source: {source}", file=sys.stderr)
+    else:
+        print("no cached source, detecting...", file=sys.stderr)
+        source = detect_best_source()
+        if source:
+            with open('/tmp/voicetype-audio-source', 'w') as f:
+                f.write(source)
 
-    proc = subprocess.Popen(
-        ['parec', '--raw', '--format=s16le', '--rate=16000', '--channels=1'],
-        stdout=subprocess.PIPE
-    )
+    # start parec IMMEDIATELY
+    cmd = ['parec', '--raw', '--format=s16le', '--rate=16000', '--channels=1']
+    if source:
+        cmd.append(f'--device={source}')
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    print("parec started", file=sys.stderr)
+
+    # load model + preprocessor in background
+    chunker = VADChunker()
+    def bg_init():
+        chunker.load_model()
+        chunker.load_preprocessor()
+    threading.Thread(target=bg_init, daemon=True).start()
+
+    # update source cache in background for next run
+    threading.Thread(target=update_source_cache, daemon=True).start()
 
     try:
         while True:

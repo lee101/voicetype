@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,6 +23,7 @@ import (
 
 type Config struct {
 	APIKey string `json:"api_key"`
+	FalKey string `json:"-"`
 }
 
 type APIResponse struct {
@@ -37,6 +39,7 @@ var (
 )
 
 const chunkDir = "/tmp/voicetype-chunks"
+const localModelSocket = "/tmp/voicetype-model.sock"
 
 type ChunkResult struct {
 	Index int
@@ -48,11 +51,37 @@ var (
 	chunkResultsMu sync.Mutex
 	chunkWg        sync.WaitGroup
 	vadCmd         *exec.Cmd
+	localModelMu   sync.Mutex
+	localModelReady bool
+	localModelWarming bool
+	instanceRecordingFlag string
+	lastHotkeyTime time.Time
 )
+
+var nemoPythonPath = findNemoPython()
+
+func findNemoPython() string {
+	home, _ := os.UserHomeDir()
+	venv := filepath.Join(home, "code", "20-questions", ".venv", "bin", "python3")
+	if _, err := os.Stat(venv); err == nil {
+		return venv
+	}
+	if p, err := exec.LookPath("python3"); err == nil {
+		return p
+	}
+	return "/usr/bin/python3"
+}
+
+type localASRResponse struct {
+	Status string `json:"status"`
+	Text   string `json:"text"`
+	Error  string `json:"error"`
+}
 
 func main() {
 	home, _ := os.UserHomeDir()
 	configPath = filepath.Join(home, ".config", "voicetype", "config.json")
+	instanceRecordingFlag = filepath.Join(os.TempDir(), fmt.Sprintf("voicetype-recording-%d", os.Getpid()))
 	loadConfig()
 
 	if config.APIKey == "" {
@@ -74,67 +103,35 @@ func main() {
 }
 
 func loadConfig() {
-	// Env var takes priority
 	if key := os.Getenv("TEXT_GENERATOR_API_KEY"); key != "" {
 		config.APIKey = key
-		return
 	}
+	if key := os.Getenv("FAL_KEY"); key != "" {
+		config.FalKey = key
+	}
+
 	data, err := os.ReadFile(configPath)
+	if err == nil {
+		json.Unmarshal(data, &config)
+	}
+
+	envFile := filepath.Join(filepath.Dir(configPath), "env")
+	envData, err := os.ReadFile(envFile)
 	if err != nil {
 		return
 	}
-	json.Unmarshal(data, &config)
+	for _, line := range strings.Split(string(envData), "\n") {
+		line = strings.TrimSpace(line)
+		if config.APIKey == "" && strings.HasPrefix(line, "TEXT_GENERATOR_API_KEY=") {
+			config.APIKey = strings.Trim(strings.SplitN(line, "=", 2)[1], "\"' ")
+		}
+		if config.FalKey == "" && strings.HasPrefix(line, "FAL_KEY=") {
+			config.FalKey = strings.Trim(strings.SplitN(line, "=", 2)[1], "\"' ")
+		}
+	}
 }
 
 func startHotkeyListener() {
-	listenForHotkey()
-}
-
-func listenForHotkey() {
-	runXbindkeysListener()
-}
-
-func runXbindkeysListener() {
-	tmpDir := os.TempDir()
-	fifoPath := filepath.Join(tmpDir, "voicetype-fifo")
-	os.Remove(fifoPath)
-	syscall.Mkfifo(fifoPath, 0600)
-
-	xbindkeysrc := filepath.Join(tmpDir, "voicetype-xbindkeysrc")
-	rcContent := fmt.Sprintf(`"echo trigger > %s"
-    Control+Mod4 + h
-`, fifoPath)
-	os.WriteFile(xbindkeysrc, []byte(rcContent), 0600)
-
-	// Kill any existing xbindkeys for this config
-	exec.Command("pkill", "-f", "xbindkeys.*voicetype").Run()
-
-	cmd := exec.Command("xbindkeys", "-n", "-f", xbindkeysrc)
-	cmd.Start()
-
-	go func() {
-		for {
-			data, err := os.ReadFile(fifoPath)
-			if err != nil {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			if len(data) > 0 {
-				os.Truncate(fifoPath, 0)
-				handleHotkey()
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	}()
-
-	// Fallback: also try with direct approach
-	go directHotkeyPoll()
-
-	select {}
-}
-
-func directHotkeyPoll() {
-	// Use dbus or direct X11 - for now use a named pipe with a helper
 	home, _ := os.UserHomeDir()
 	triggerFile := filepath.Join(home, ".cache", "voicetype-trigger")
 	os.MkdirAll(filepath.Dir(triggerFile), 0755)
@@ -144,11 +141,17 @@ func directHotkeyPoll() {
 			os.Remove(triggerFile)
 			handleHotkey()
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(80 * time.Millisecond)
 	}
 }
 
 func handleHotkey() {
+	now := time.Now()
+	if now.Sub(lastHotkeyTime) < 500*time.Millisecond {
+		return
+	}
+	lastHotkeyTime = now
+
 	if recording {
 		stopRecording()
 	} else {
@@ -166,12 +169,13 @@ func getActiveWindow() string {
 
 func startRecording() {
 	recording = true
+	os.WriteFile(instanceRecordingFlag, []byte("1"), 0600)
 	chunkResults = make(map[int]string)
 
 	activeWin := getActiveWindow()
 	os.WriteFile(filepath.Join(os.TempDir(), "voicetype-window"), []byte(activeWin), 0600)
 
-	// Preload local model in background (for fallback)
+	// Eagerly warm local ASR model in background.
 	go preloadLocalModel()
 
 	os.WriteFile("/tmp/voicetype-visualizer-run", []byte("1"), 0600)
@@ -220,6 +224,7 @@ func startRecording() {
 
 func stopRecording() {
 	recording = false
+	os.Remove(instanceRecordingFlag)
 
 	hideVisualizer()
 
@@ -275,8 +280,11 @@ func stopRecording() {
 	hideSpinner()
 
 	if text != "" {
-		winData, _ := os.ReadFile(filepath.Join(os.TempDir(), "voicetype-window"))
-		windowID := string(bytes.TrimSpace(winData))
+		windowID := string(bytes.TrimSpace([]byte(getActiveWindow())))
+		if windowID == "" {
+			winData, _ := os.ReadFile(filepath.Join(os.TempDir(), "voicetype-window"))
+			windowID = string(bytes.TrimSpace(winData))
+		}
 		typeText(windowID, text)
 	}
 }
@@ -340,7 +348,8 @@ func processReadyChunks() {
 func uploadChunk(path string, index int) {
 	defer chunkWg.Done()
 
-	text := transcribeChunk(path)
+	rawPath := strings.TrimSuffix(path, filepath.Ext(path)) + ".raw.ogg"
+	text := transcribeChunk(path, rawPath)
 
 	chunkResultsMu.Lock()
 	chunkResults[index] = text
@@ -349,7 +358,71 @@ func uploadChunk(path string, index int) {
 	fmt.Printf("Chunk %d: %s\n", index, truncate(text, 50))
 }
 
-func transcribeChunk(audioPath string) string {
+func transcribeChunk(processedPath string, rawPath string) string {
+	localText := transcribeLocal(processedPath)
+	if localText == "" && rawPath != processedPath {
+		if _, err := os.Stat(rawPath); err == nil {
+			if t := transcribeLocal(rawPath); betterText(t, localText) {
+				localText = t
+			}
+		}
+	}
+	if localText != "" {
+		return localText
+	}
+
+	fmt.Println("Local ASR empty, racing API + fal...")
+	result := make(chan string, 2)
+
+	go func() {
+		t := transcribeChunkAPI(processedPath)
+		if t == "" && rawPath != processedPath {
+			if _, err := os.Stat(rawPath); err == nil {
+				if rt := transcribeChunkAPI(rawPath); betterText(rt, t) {
+					t = rt
+				}
+			}
+		}
+		result <- t
+	}()
+
+	go func() {
+		t := transcribeFal(processedPath)
+		if t == "" && rawPath != processedPath {
+			if _, err := os.Stat(rawPath); err == nil {
+				if rt := transcribeFal(rawPath); betterText(rt, t) {
+					t = rt
+				}
+			}
+		}
+		result <- t
+	}()
+
+	for i := 0; i < 2; i++ {
+		if t := <-result; t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+func betterText(a string, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" {
+		return false
+	}
+	if b == "" {
+		return true
+	}
+	return len(a) > len(b)+4
+}
+
+func transcribeChunkAPI(audioPath string) string {
+	if config.APIKey == "" {
+		return ""
+	}
+
 	file, err := os.Open(audioPath)
 	if err != nil {
 		return ""
@@ -367,10 +440,10 @@ func transcribeChunk(audioPath string) string {
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("secret", config.APIKey)
 
-	client := &http.Client{Timeout: 300 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("Chunk upload error:", err)
+		fmt.Println("Chunk API error:", err)
 		return ""
 	}
 	defer resp.Body.Close()
@@ -384,6 +457,42 @@ func transcribeChunk(audioPath string) string {
 	json.Unmarshal(body, &result)
 
 	return result.Text
+}
+
+func transcribeFal(audioPath string) string {
+	locations := []string{
+		filepath.Join(filepath.Dir(os.Args[0]), "fal_whisper.py"),
+		"/usr/local/share/voicetype/fal_whisper.py",
+		filepath.Join(os.Getenv("HOME"), ".local/share/voicetype/fal_whisper.py"),
+	}
+
+	var scriptPath string
+	for _, loc := range locations {
+		if _, err := os.Stat(loc); err == nil {
+			scriptPath = loc
+			break
+		}
+	}
+
+	if scriptPath == "" {
+		return ""
+	}
+
+	cmd := exec.Command("/usr/bin/python3", scriptPath, audioPath)
+	if config.FalKey != "" {
+		cmd.Env = append(os.Environ(), "FAL_KEY="+config.FalKey)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		fmt.Println("Fal whisper error:", err)
+		return ""
+	}
+
+	text := string(bytes.TrimSpace(out))
+	if text != "" {
+		fmt.Println("Fal transcribed:", truncate(text, 50))
+	}
+	return text
 }
 
 func combineChunkResults() string {
@@ -418,22 +527,61 @@ func truncate(s string, n int) string {
 }
 
 func preloadLocalModel() {
-	locations := []string{
-		filepath.Join(filepath.Dir(os.Args[0]), "fallback_asr.py"),
-		"/usr/local/share/voicetype/fallback_asr.py",
-		filepath.Join(os.Getenv("HOME"), ".local/share/voicetype/fallback_asr.py"),
+	localModelMu.Lock()
+	if localModelReady || localModelWarming {
+		localModelMu.Unlock()
+		return
 	}
+	localModelWarming = true
+	localModelMu.Unlock()
 
-	var scriptPath string
-	for _, loc := range locations {
-		if _, err := os.Stat(loc); err == nil {
-			scriptPath = loc
-			break
+	go func() {
+		ready := false
+
+		if _, err := localASRRequest("preload", ""); err == nil {
+			ready = true
+		} else {
+			serverScript := findScriptPath("model_server.py")
+			if serverScript != "" {
+				if isSocketStale(localModelSocket) {
+					os.Remove(localModelSocket)
+				}
+
+				exec.Command(nemoPythonPath, serverScript).Start()
+
+				deadline := time.Now().Add(18 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, err := localASRRequest("preload", ""); err == nil {
+						ready = true
+						break
+					}
+					time.Sleep(250 * time.Millisecond)
+				}
+			}
 		}
-	}
 
-	if scriptPath != "" {
-		exec.Command("/usr/bin/python3", scriptPath, "preload").Run()
+		localModelMu.Lock()
+		localModelReady = ready
+		localModelWarming = false
+		localModelMu.Unlock()
+	}()
+}
+
+func waitForLocalModelReady(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		localModelMu.Lock()
+		ready := localModelReady
+		warming := localModelWarming
+		localModelMu.Unlock()
+
+		if ready {
+			return true
+		}
+		if !warming || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -504,14 +652,22 @@ func wasCancelled() bool {
 }
 
 func transcribeAudio(audioPath string) string {
-	// Try API first, fall back to local
-	text := transcribeAPI(audioPath)
+	text := transcribeLocal(audioPath)
 	if text != "" {
 		return text
 	}
 
-	fmt.Println("API failed, trying local Parakeet...")
-	return transcribeLocal(audioPath)
+	text = transcribeAPI(audioPath)
+	if text != "" {
+		return text
+	}
+
+	fmt.Println("API failed, trying fal whisper...")
+	text = transcribeFal(audioPath)
+	if text != "" {
+		return text
+	}
+	return ""
 }
 
 func transcribeAPI(audioPath string) string {
@@ -552,7 +708,7 @@ func transcribeAPI(audioPath string) string {
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("secret", config.APIKey)
 
-	client := &http.Client{Timeout: 300 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Println("API request error:", err)
@@ -580,35 +736,105 @@ func transcribeAPI(audioPath string) string {
 }
 
 func transcribeLocal(audioPath string) string {
-	locations := []string{
-		filepath.Join(filepath.Dir(os.Args[0]), "fallback_asr.py"),
-		"/usr/local/share/voicetype/fallback_asr.py",
-		filepath.Join(os.Getenv("HOME"), ".local/share/voicetype/fallback_asr.py"),
-	}
-
-	var scriptPath string
-	for _, loc := range locations {
-		if _, err := os.Stat(loc); err == nil {
-			scriptPath = loc
-			break
-		}
-	}
-
-	if scriptPath == "" {
-		fmt.Println("Local ASR not available")
+	preloadLocalModel()
+	if !waitForLocalModelReady(1500 * time.Millisecond) {
 		return ""
 	}
 
-	cmd := exec.Command("/usr/bin/python3", scriptPath, audioPath)
-	out, err := cmd.Output()
+	text, err := localASRRequest("transcribe", audioPath)
 	if err != nil {
+		localModelMu.Lock()
+		localModelReady = false
+		localModelMu.Unlock()
+
 		fmt.Println("Local ASR error:", err)
 		return ""
 	}
 
-	text := string(bytes.TrimSpace(out))
+	text = strings.TrimSpace(text)
+	if text == "" {
+		fmt.Println("Local ASR not available")
+		return ""
+	}
+
 	fmt.Println("Local transcribed:", text)
 	return text
+}
+
+func findScriptPath(name string) string {
+	locations := []string{
+		filepath.Join(filepath.Dir(os.Args[0]), name),
+		"/usr/local/share/voicetype/" + name,
+		filepath.Join(os.Getenv("HOME"), ".local/share/voicetype", name),
+	}
+
+	for _, loc := range locations {
+		if _, err := os.Stat(loc); err == nil {
+			return loc
+		}
+	}
+
+	return ""
+}
+
+func isSocketStale(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", path, 150*time.Millisecond)
+	if err != nil {
+		return true
+	}
+	conn.Close()
+	return false
+}
+
+func localASRRequest(action, audioPath string) (string, error) {
+	payload := map[string]string{"action": action}
+	if audioPath != "" {
+		payload["path"] = audioPath
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	conn, err := net.DialTimeout("unix", localModelSocket, 200*time.Millisecond)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(45 * time.Second))
+	if _, err := conn.Write(body); err != nil {
+		return "", err
+	}
+
+	respBytes, err := io.ReadAll(conn)
+	if err != nil {
+		return "", err
+	}
+
+	var resp localASRResponse
+	if err := json.Unmarshal(respBytes, &resp); err != nil {
+		return "", err
+	}
+
+	if resp.Error != "" {
+		return "", fmt.Errorf(resp.Error)
+	}
+	if action == "preload" {
+		if resp.Status != "ok" {
+			return "", fmt.Errorf("local preload failed")
+		}
+		return "", nil
+	}
+
+	if resp.Text == "" && resp.Status != "ok" {
+		return "", nil
+	}
+
+	return strings.TrimSpace(resp.Text), nil
 }
 
 func typeText(windowID, text string) {
