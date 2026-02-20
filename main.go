@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"crypto/sha1"
 	"fmt"
@@ -73,7 +74,37 @@ var (
 	autoLearnLastRan time.Time
 	autoLearnStatePath string
 	instanceLock *os.File
+	benchmarkMu sync.Mutex
+	benchmarkData BenchmarkData
+	benchmarkPath string
  )
+
+const benchmarkWindowSize = 20
+
+type WordBucket string
+const (
+	BucketShort  WordBucket = "short"
+	BucketMedium WordBucket = "medium"
+	BucketLong   WordBucket = "long"
+)
+
+type TranscriptionRecord struct {
+	Provider  string     `json:"provider"`
+	ElapsedMs float64    `json:"elapsed_ms"`
+	WordCount int        `json:"word_count"`
+	Bucket    WordBucket `json:"bucket"`
+	Timestamp int64      `json:"ts"`
+}
+
+type BenchmarkData struct {
+	Stats map[string]map[WordBucket][]TranscriptionRecord `json:"stats"`
+}
+
+type providerEntry struct {
+	name       string
+	available  func() bool
+	transcribe func(string) string
+}
 
 type AutoLearnState struct {
 	UseCount int `json:"use_count"`
@@ -115,6 +146,8 @@ func main() {
 	autoLearnStatePath = filepath.Join(filepath.Dir(configPath), "auto_learn_state.json")
 	instanceRecordingFlag = filepath.Join(os.TempDir(), fmt.Sprintf("voicetype-recording-%d", os.Getpid()))
 	loadConfig()
+	benchmarkPath = filepath.Join(filepath.Dir(configPath), "provider_stats.json")
+	loadBenchmark()
 
 	if config.APIKey == "" {
 		fmt.Println("No API key configured. Set it in:", configPath)
@@ -303,6 +336,13 @@ func getGroqKey() string {
 	return getEnvFileValue("GROQ_API_KEY")
 }
 
+func getGeminiKey() string {
+	if key := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); key != "" {
+		return key
+	}
+	return getEnvFileValue("GEMINI_API_KEY")
+}
+
 func resolveAutoLearnProvider() string {
 	provider := strings.TrimSpace(os.Getenv("VOICETYPE_AUTO_LEARN_PROVIDER"))
 	if provider != "" {
@@ -310,6 +350,9 @@ func resolveAutoLearnProvider() string {
 	}
 	if getGroqKey() != "" {
 		return "groq"
+	}
+	if getGeminiKey() != "" {
+		return "gemini"
 	}
 	if config.FalKey != "" {
 		return "fal"
@@ -321,6 +364,8 @@ func resolveAutoLearnProfile(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "groq":
 		return "speed"
+	case "gemini":
+		return "balanced"
 	case "fal":
 		return "clean"
 	default:
@@ -459,7 +504,7 @@ func startAutoOptimization() {
 	if !getEnvBool("VOICETYPE_AUTO_LEARN", true) {
 		return
 	}
-	if config.APIKey == "" && config.FalKey == "" && getGroqKey() == "" {
+	if config.APIKey == "" && config.FalKey == "" && getGroqKey() == "" && getGeminiKey() == "" {
 		fmt.Println("auto-learning skipped: no API key configured")
 		return
 	}
@@ -576,6 +621,9 @@ func startAutoOptimization() {
 		}
 	if groqKey := getGroqKey(); strings.TrimSpace(groqKey) != "" {
 		cmd.Env = setEnvValue(cmd.Env, "GROQ_API_KEY", groqKey)
+	}
+	if geminiKey := getGeminiKey(); geminiKey != "" {
+		cmd.Env = setEnvValue(cmd.Env, "GEMINI_API_KEY", geminiKey)
 	}
 
 		fmt.Printf("auto-learning: running %s\n", strings.Join(args, " "))
@@ -829,56 +877,159 @@ func uploadChunk(path string, index int) {
 	fmt.Printf("Chunk %d: %s\n", index, truncate(text, 50))
 }
 
+func wordBucket(n int) WordBucket {
+	if n <= 5 {
+		return BucketShort
+	}
+	if n <= 20 {
+		return BucketMedium
+	}
+	return BucketLong
+}
+
+func loadBenchmark() {
+	benchmarkMu.Lock()
+	defer benchmarkMu.Unlock()
+	benchmarkData.Stats = make(map[string]map[WordBucket][]TranscriptionRecord)
+	data, err := os.ReadFile(benchmarkPath)
+	if err != nil {
+		return
+	}
+	json.Unmarshal(data, &benchmarkData)
+	if benchmarkData.Stats == nil {
+		benchmarkData.Stats = make(map[string]map[WordBucket][]TranscriptionRecord)
+	}
+}
+
+func saveBenchmark() {
+	data, err := json.MarshalIndent(benchmarkData, "", "  ")
+	if err != nil {
+		return
+	}
+	os.MkdirAll(filepath.Dir(benchmarkPath), 0755)
+	os.WriteFile(benchmarkPath, data, 0644)
+}
+
+func recordTranscription(provider string, elapsedMs float64, text string) {
+	wc := len(strings.Fields(text))
+	bucket := wordBucket(wc)
+	rec := TranscriptionRecord{
+		Provider:  provider,
+		ElapsedMs: elapsedMs,
+		WordCount: wc,
+		Bucket:    bucket,
+		Timestamp: time.Now().Unix(),
+	}
+	benchmarkMu.Lock()
+	defer benchmarkMu.Unlock()
+	if benchmarkData.Stats == nil {
+		benchmarkData.Stats = make(map[string]map[WordBucket][]TranscriptionRecord)
+	}
+	if benchmarkData.Stats[provider] == nil {
+		benchmarkData.Stats[provider] = make(map[WordBucket][]TranscriptionRecord)
+	}
+	recs := append(benchmarkData.Stats[provider][bucket], rec)
+	if len(recs) > benchmarkWindowSize {
+		recs = recs[len(recs)-benchmarkWindowSize:]
+	}
+	benchmarkData.Stats[provider][bucket] = recs
+	saveBenchmark()
+}
+
+func avgLatency(provider string, bucket WordBucket) (float64, bool) {
+	benchmarkMu.Lock()
+	defer benchmarkMu.Unlock()
+	recs, ok := benchmarkData.Stats[provider][bucket]
+	if !ok || len(recs) == 0 {
+		return 0, false
+	}
+	var sum float64
+	for _, r := range recs {
+		sum += r.ElapsedMs
+	}
+	return sum / float64(len(recs)), true
+}
+
+func avgLatencyOverall(provider string) (float64, bool) {
+	benchmarkMu.Lock()
+	defer benchmarkMu.Unlock()
+	buckets, ok := benchmarkData.Stats[provider]
+	if !ok {
+		return 0, false
+	}
+	var sum float64
+	var count int
+	for _, recs := range buckets {
+		for _, r := range recs {
+			sum += r.ElapsedMs
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, false
+	}
+	return sum / float64(count), true
+}
+
+func getProviderOrder() []providerEntry {
+	return []providerEntry{
+		{"groq", func() bool { return getGroqKey() != "" }, transcribeGroq},
+		{"gemini", func() bool { return getGeminiKey() != "" }, transcribeGemini},
+		{"textgen", func() bool { return config.APIKey != "" }, transcribeChunkAPI},
+		{"fal", func() bool { return config.FalKey != "" || findScriptPath("fal_whisper.py") != "" }, transcribeFal},
+		{"local", func() bool { return true }, transcribeLocal},
+	}
+}
+
+func rankedProviders(bucket WordBucket) []providerEntry {
+	providers := getProviderOrder()
+	sort.SliceStable(providers, func(i, j int) bool {
+		li, oki := avgLatency(providers[i].name, bucket)
+		if !oki {
+			li, oki = avgLatencyOverall(providers[i].name)
+		}
+		lj, okj := avgLatency(providers[j].name, bucket)
+		if !okj {
+			lj, okj = avgLatencyOverall(providers[j].name)
+		}
+		if !oki || !okj {
+			return false
+		}
+		return li < lj
+	})
+	return providers
+}
+
+func timedTranscribe(name string, fn func(string) string, audioPath string) string {
+	start := time.Now()
+	text := fn(audioPath)
+	if text != "" {
+		elapsed := float64(time.Since(start).Milliseconds())
+		recordTranscription(name, elapsed, text)
+	}
+	return text
+}
+
 func transcribeChunk(processedPath string, rawPath string) string {
-	// Groq first
-	groqText := transcribeGroq(processedPath)
-	if groqText == "" && rawPath != processedPath {
-		if _, err := os.Stat(rawPath); err == nil {
-			if rt := transcribeGroq(rawPath); betterText(rt, groqText) {
-				groqText = rt
+	providers := rankedProviders(BucketMedium)
+	fmt.Println("fastest:", providers[0].name)
+	for _, p := range providers {
+		if !p.available() {
+			continue
+		}
+		text := timedTranscribe(p.name, p.transcribe, processedPath)
+		if text == "" && rawPath != processedPath {
+			if _, err := os.Stat(rawPath); err == nil {
+				if rt := timedTranscribe(p.name, p.transcribe, rawPath); betterText(rt, text) {
+					text = rt
+				}
 			}
 		}
-	}
-	if groqText != "" {
-		return groqText
-	}
-
-	// text-generator fallback
-	textAPI := transcribeChunkAPI(processedPath)
-	if textAPI == "" && rawPath != processedPath {
-		if _, err := os.Stat(rawPath); err == nil {
-			if rt := transcribeChunkAPI(rawPath); betterText(rt, textAPI) {
-				textAPI = rt
-			}
+		if text != "" {
+			return text
 		}
 	}
-	if textAPI != "" {
-		return textAPI
-	}
-
-	// fal fallback
-	falText := transcribeFal(processedPath)
-	if falText == "" && rawPath != processedPath {
-		if _, err := os.Stat(rawPath); err == nil {
-			if rt := transcribeFal(rawPath); betterText(rt, falText) {
-				falText = rt
-			}
-		}
-	}
-	if falText != "" {
-		return falText
-	}
-
-	// local fallback
-	localText := transcribeLocal(processedPath)
-	if localText == "" && rawPath != processedPath {
-		if _, err := os.Stat(rawPath); err == nil {
-			if rt := transcribeLocal(rawPath); betterText(rt, localText) {
-				localText = rt
-			}
-		}
-	}
-	return localText
+	return ""
 }
 
 func betterText(a string, b string) bool {
@@ -956,6 +1107,99 @@ func transcribeGroq(audioPath string) string {
 	}
 	fmt.Println("Groq transcribed:", truncate(result.Text, 50))
 	return result.Text
+}
+
+func transcribeGemini(audioPath string) string {
+	key := getGeminiKey()
+	if key == "" {
+		return ""
+	}
+
+	audioData, err := os.ReadFile(audioPath)
+	if err != nil {
+		return ""
+	}
+	b64 := base64.StdEncoding.EncodeToString(audioData)
+
+	mime := "audio/ogg"
+	if strings.HasSuffix(audioPath, ".wav") {
+		mime = "audio/wav"
+	} else if strings.HasSuffix(audioPath, ".mp3") {
+		mime = "audio/mp3"
+	}
+
+	reqBody := map[string]interface{}{
+		"contents": []map[string]interface{}{
+			{
+				"role": "user",
+				"parts": []map[string]interface{}{
+					{"text": "Transcribe this audio exactly. Output only the transcription text, nothing else."},
+					{"inline_data": map[string]interface{}{"mime_type": mime, "data": b64}},
+				},
+			},
+		},
+		"generationConfig": map[string]interface{}{
+			"thinkingConfig": map[string]interface{}{
+				"thinkingLevel": "LOW",
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return ""
+	}
+
+	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=" + key
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("Gemini error:", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		fmt.Println("Gemini API error:", resp.StatusCode, truncate(string(body), 200))
+		return ""
+	}
+
+	var gemResp struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text    string `json:"text"`
+					Thought bool   `json:"thought"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+	}
+	if err := json.Unmarshal(body, &gemResp); err != nil {
+		fmt.Println("Gemini parse error:", err)
+		return ""
+	}
+
+	var texts []string
+	for _, c := range gemResp.Candidates {
+		for _, p := range c.Content.Parts {
+			if p.Thought {
+				continue
+			}
+			if t := strings.TrimSpace(p.Text); t != "" {
+				texts = append(texts, t)
+			}
+		}
+	}
+	text := strings.Join(texts, " ")
+	if text == "" {
+		return ""
+	}
+	fmt.Println("Gemini transcribed:", truncate(text, 50))
+	return text
 }
 
 func transcribeChunkAPI(audioPath string) string {
@@ -1178,24 +1422,7 @@ func wasCancelled() bool {
 }
 
 func transcribeAudio(audioPath string) string {
-	text := transcribeGroq(audioPath)
-	if text != "" {
-		return text
-	}
-
-	text = transcribeAPI(audioPath)
-	if text != "" {
-		return text
-	}
-
-	fmt.Println("API failed, trying fal whisper...")
-	text = transcribeFal(audioPath)
-	if text != "" {
-		return text
-	}
-
-	fmt.Println("Fal failed, trying local Parakeet...")
-	return transcribeLocal(audioPath)
+	return transcribeChunk(audioPath, audioPath)
 }
 
 func transcribeAPI(audioPath string) string {
