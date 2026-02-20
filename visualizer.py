@@ -176,4 +176,5 @@ if __name__ == "__main__":
 
     win = WaveformVisualizer()
     win.show_all()
+    win.present()
     Gtk.main()

@@ -796,12 +796,15 @@ func stopRecording() {
 
 	hideSpinner()
 
+	winData, _ := os.ReadFile(filepath.Join(os.TempDir(), "voicetype-window"))
+	windowID := string(bytes.TrimSpace(winData))
+	if windowID != "" {
+		exec.Command("xdotool", "windowactivate", "--sync", windowID).Run()
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	text = strings.TrimSpace(text)
 	if text != "" {
-		windowID := string(bytes.TrimSpace([]byte(getActiveWindow())))
-		if windowID == "" {
-			winData, _ := os.ReadFile(filepath.Join(os.TempDir(), "voicetype-window"))
-			windowID = string(bytes.TrimSpace(winData))
-		}
 		typeText(windowID, text)
 	}
 

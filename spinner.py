@@ -14,6 +14,7 @@ class Spinner(Gtk.Window):
         self.set_decorated(False)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_resizable(False)
+        self.set_accept_focus(False)
 
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
