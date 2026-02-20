@@ -1604,7 +1604,18 @@ func typeText(windowID, text string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Type the text
-	exec.Command("xdotool", "type", "--clearmodifiers", "--", text).Run()
-	fmt.Println("Typed text into window")
+	oldClip, _ := exec.Command("xclip", "-selection", "clipboard", "-o").Output()
+
+	cmd := exec.Command("xclip", "-selection", "clipboard")
+	cmd.Stdin = strings.NewReader(text)
+	cmd.Run()
+
+	exec.Command("xdotool", "key", "--clearmodifiers", "ctrl+v").Run()
+	time.Sleep(150 * time.Millisecond)
+
+	restore := exec.Command("xclip", "-selection", "clipboard")
+	restore.Stdin = bytes.NewReader(oldClip)
+	restore.Run()
+
+	fmt.Println("Pasted text into window")
 }
