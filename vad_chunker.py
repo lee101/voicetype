@@ -10,6 +10,8 @@ import queue
 import threading
 import numpy as np
 
+from audio_source import detect_best_source, ensure_working_source
+
 SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # 480 samples
@@ -49,63 +51,6 @@ FORCE_NO_PREPROCESS = env_true("VOICETYPE_DISABLE_PREPROCESS")
 SAVE_RAW_CHUNKS = env_true("VOICETYPE_SAVE_RAW_CHUNK", False)
 SAMPLE_QUEUE_SIZE = 16
 
-
-def detect_best_source():
-    """Probe each PulseAudio input source briefly, return the one with highest signal."""
-    try:
-        result = subprocess.run(
-            ['pactl', 'list', 'short', 'sources'],
-            capture_output=True, text=True, timeout=5
-        )
-    except Exception:
-        return None
-
-    sources = []
-    for line in result.stdout.strip().split('\n'):
-        parts = line.split('\t')
-        if len(parts) < 2:
-            continue
-        name = parts[1]
-        # skip monitor sources (output loopback)
-        if '.monitor' in name:
-            continue
-        sources.append(name)
-
-    if not sources:
-        return None
-
-    best_source = None
-    best_peak = -1.0
-
-    for src in sources:
-        try:
-            proc = subprocess.Popen(
-                ['parec', '--raw', '--format=s16le', '--rate=16000', '--channels=1',
-                 f'--device={src}'],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
-            raw = proc.stdout.read(SAMPLE_RATE * 2)  # 0.5s probe
-            proc.terminate()
-            proc.wait(timeout=2)
-
-            if raw:
-                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                peak = float(np.max(np.abs(samples)))
-                rms = float(np.sqrt(np.mean(samples ** 2)))
-                print(f"  source {src}: peak={peak:.4f} rms={rms:.4f}", file=sys.stderr)
-                if peak > best_peak:
-                    best_peak = peak
-                    best_source = src
-        except Exception as e:
-            print(f"  source {src}: probe failed: {e}", file=sys.stderr)
-            continue
-
-    if best_source and best_peak > 0.005:
-        print(f"  selected: {best_source} (peak={best_peak:.4f})", file=sys.stderr)
-        return best_source
-
-    print("  no good source found, using default", file=sys.stderr)
-    return None
 
 class VADChunker:
     def __init__(self):
@@ -548,24 +493,11 @@ def write_wav_header(f, num_samples, sample_rate):
     f.write(b'data')
     f.write(struct.pack('<I', data_size))
 
-def get_cached_source():
-    source_file = '/tmp/voicetype-audio-source'
-    try:
-        with open(source_file) as f:
-            src = f.read().strip()
-        if src:
-            return src
-    except Exception:
-        pass
-    return None
-
-
 def update_source_cache():
     source = detect_best_source()
-    source_file = '/tmp/voicetype-audio-source'
     if source:
-        with open(source_file, 'w') as f:
-            f.write(source)
+        # ensure helper updates the cache file consistently
+        ensure_working_source(preferred=source)
 
 
 def main():
@@ -574,16 +506,11 @@ def main():
     for f in os.listdir(CHUNK_DIR):
         os.remove(os.path.join(CHUNK_DIR, f))
 
-    # use cached source for instant startup
-    source = get_cached_source()
+    source = ensure_working_source()
     if source:
-        print(f"using cached source: {source}", file=sys.stderr)
+        print(f"using source: {source}", file=sys.stderr)
     else:
-        print("no cached source, detecting...", file=sys.stderr)
-        source = detect_best_source()
-        if source:
-            with open('/tmp/voicetype-audio-source', 'w') as f:
-                f.write(source)
+        print("no source selected; using PulseAudio default", file=sys.stderr)
 
     # start parec IMMEDIATELY
     cmd = ['parec', '--raw', '--format=s16le', '--rate=16000', '--channels=1']

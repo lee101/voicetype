@@ -11,6 +11,8 @@ import subprocess
 import threading
 import queue
 
+from audio_source import ensure_working_source
+
 class WaveformVisualizer(Gtk.Window):
     def __init__(self):
         super().__init__(title="VoiceType")
@@ -19,6 +21,9 @@ class WaveformVisualizer(Gtk.Window):
         self.set_decorated(False)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_resizable(False)
+        self.set_accept_focus(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.connect("map-event", self._on_map)
 
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
@@ -42,17 +47,24 @@ class WaveformVisualizer(Gtk.Window):
 
         self.start_audio_monitor()
 
+    def _on_map(self, widget, event):
+        GLib.timeout_add(50, self._grab_focus)
+        return False
+
+    def _grab_focus(self):
+        gdk_win = self.get_window()
+        if gdk_win:
+            gdk_win.focus(Gdk.CURRENT_TIME)
+            self.present_with_time(Gdk.CURRENT_TIME)
+        return False
+
     def start_audio_monitor(self):
         def monitor():
             try:
                 cmd = ['parec', '--raw', '--format=s16le', '--rate=8000', '--channels=1']
-                try:
-                    with open('/tmp/voicetype-audio-source') as f:
-                        src = f.read().strip()
-                    if src:
-                        cmd.append(f'--device={src}')
-                except FileNotFoundError:
-                    pass
+                src = ensure_working_source()
+                if src:
+                    cmd.append(f'--device={src}')
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -176,5 +188,5 @@ if __name__ == "__main__":
 
     win = WaveformVisualizer()
     win.show_all()
-    win.present()
+    win.present_with_time(Gdk.CURRENT_TIME)
     Gtk.main()

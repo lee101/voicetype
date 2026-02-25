@@ -798,10 +798,6 @@ func stopRecording() {
 
 	winData, _ := os.ReadFile(filepath.Join(os.TempDir(), "voicetype-window"))
 	windowID := string(bytes.TrimSpace(winData))
-	if windowID != "" {
-		exec.Command("xdotool", "windowactivate", "--sync", windowID).Run()
-		time.Sleep(100 * time.Millisecond)
-	}
 
 	text = strings.TrimSpace(text)
 	if text != "" {
@@ -976,8 +972,8 @@ func avgLatencyOverall(provider string) (float64, bool) {
 
 func getProviderOrder() []providerEntry {
 	return []providerEntry{
-		{"groq", func() bool { return getGroqKey() != "" }, transcribeGroq},
 		{"gemini", func() bool { return getGeminiKey() != "" }, transcribeGemini},
+		{"groq", func() bool { return getGroqKey() != "" }, transcribeGroq},
 		{"textgen", func() bool { return config.APIKey != "" }, transcribeChunkAPI},
 		{"fal", func() bool { return config.FalKey != "" || findScriptPath("fal_whisper.py") != "" }, transcribeFal},
 		{"local", func() bool { return true }, transcribeLocal},
@@ -986,21 +982,31 @@ func getProviderOrder() []providerEntry {
 
 func rankedProviders(bucket WordBucket) []providerEntry {
 	providers := getProviderOrder()
-	sort.SliceStable(providers, func(i, j int) bool {
-		li, oki := avgLatency(providers[i].name, bucket)
-		if !oki {
-			li, oki = avgLatencyOverall(providers[i].name)
+	// Gemini is always first (best WER); rank the rest by latency
+	var pinned []providerEntry
+	var rest []providerEntry
+	for _, p := range providers {
+		if p.name == "gemini" {
+			pinned = append(pinned, p)
+		} else {
+			rest = append(rest, p)
 		}
-		lj, okj := avgLatency(providers[j].name, bucket)
+	}
+	sort.SliceStable(rest, func(i, j int) bool {
+		li, oki := avgLatency(rest[i].name, bucket)
+		if !oki {
+			li, oki = avgLatencyOverall(rest[i].name)
+		}
+		lj, okj := avgLatency(rest[j].name, bucket)
 		if !okj {
-			lj, okj = avgLatencyOverall(providers[j].name)
+			lj, okj = avgLatencyOverall(rest[j].name)
 		}
 		if !oki || !okj {
 			return false
 		}
 		return li < lj
 	})
-	return providers
+	return append(pinned, rest...)
 }
 
 func timedTranscribe(name string, fn func(string) string, audioPath string) string {
@@ -1136,15 +1142,14 @@ func transcribeGemini(audioPath string) string {
 			{
 				"role": "user",
 				"parts": []map[string]interface{}{
-					{"text": "Transcribe this audio exactly. Output only the transcription text, nothing else."},
+					{"text": "Transcribe audio from this programmer. No thinking. Return only the transcript."},
 					{"inline_data": map[string]interface{}{"mime_type": mime, "data": b64}},
 				},
 			},
 		},
 		"generationConfig": map[string]interface{}{
-			"thinkingConfig": map[string]interface{}{
-				"thinkingLevel": "LOW",
-			},
+			"temperature":   0,
+			"maxOutputTokens": 1024,
 		},
 	}
 
@@ -1153,22 +1158,29 @@ func transcribeGemini(audioPath string) string {
 		return ""
 	}
 
-	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=" + key
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(jsonData))
-	req.Header.Set("Content-Type", "application/json")
+	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=" + key
+	client := &http.Client{Timeout: 30 * time.Second}
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Gemini error:", err)
-		return ""
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		fmt.Println("Gemini API error:", resp.StatusCode, truncate(string(body), 200))
-		return ""
+	var body []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		req, _ := http.NewRequest("POST", apiURL, bytes.NewReader(jsonData))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Println("Gemini error:", err)
+			return ""
+		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 429 && attempt == 0 {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if resp.StatusCode != 200 {
+			fmt.Println("Gemini API error:", resp.StatusCode, truncate(string(body), 200))
+			return ""
+		}
+		break
 	}
 
 	var gemResp struct {
@@ -1380,6 +1392,19 @@ func showVisualizer() {
 
 	cmd := exec.Command("/usr/bin/python3", scriptPath)
 	cmd.Start()
+
+	go func() {
+		for i := 0; i < 20; i++ {
+			time.Sleep(50 * time.Millisecond)
+			out, err := exec.Command("xdotool", "search", "--name", "VoiceType").Output()
+			if err == nil && len(bytes.TrimSpace(out)) > 0 {
+				wid := strings.Split(string(bytes.TrimSpace(out)), "\n")[0]
+				exec.Command("xdotool", "windowactivate", "--sync", wid).Run()
+				exec.Command("xdotool", "windowfocus", "--sync", wid).Run()
+				break
+			}
+		}
+	}()
 }
 
 func hideVisualizer() {
@@ -1604,7 +1629,7 @@ func localASRRequest(action, audioPath string) (string, error) {
 func typeText(windowID, text string) {
 	if windowID != "" {
 		exec.Command("xdotool", "windowactivate", "--sync", windowID).Run()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	oldClip, _ := exec.Command("xclip", "-selection", "clipboard", "-o").Output()
@@ -1614,7 +1639,7 @@ func typeText(windowID, text string) {
 	cmd.Run()
 
 	exec.Command("xdotool", "key", "--clearmodifiers", "ctrl+v").Run()
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
 
 	restore := exec.Command("xclip", "-selection", "clipboard")
 	restore.Stdin = bytes.NewReader(oldClip)
