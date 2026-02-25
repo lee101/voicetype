@@ -11,7 +11,7 @@ import subprocess
 import threading
 import queue
 
-from audio_source import ensure_working_source
+from audio_source import get_cached_source
 
 class WaveformVisualizer(Gtk.Window):
     def __init__(self):
@@ -62,7 +62,7 @@ class WaveformVisualizer(Gtk.Window):
         def monitor():
             try:
                 cmd = ['parec', '--raw', '--format=s16le', '--rate=8000', '--channels=1']
-                src = ensure_working_source()
+                src = get_cached_source()
                 if src:
                     cmd.append(f'--device={src}')
                 proc = subprocess.Popen(

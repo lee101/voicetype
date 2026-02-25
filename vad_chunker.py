@@ -10,7 +10,7 @@ import queue
 import threading
 import numpy as np
 
-from audio_source import detect_best_source, ensure_working_source
+from audio_source import detect_best_source, ensure_working_source, get_cached_source
 
 SAMPLE_RATE = 16000
 FRAME_MS = 30
@@ -506,13 +506,13 @@ def main():
     for f in os.listdir(CHUNK_DIR):
         os.remove(os.path.join(CHUNK_DIR, f))
 
-    source = ensure_working_source()
+    source = get_cached_source()
     if source:
-        print(f"using source: {source}", file=sys.stderr)
+        print(f"using cached source: {source}", file=sys.stderr)
     else:
-        print("no source selected; using PulseAudio default", file=sys.stderr)
+        print("no cached source; using PulseAudio default", file=sys.stderr)
 
-    # start parec IMMEDIATELY
+    # start parec IMMEDIATELY (no probing - use cached source for zero delay)
     cmd = ['parec', '--raw', '--format=s16le', '--rate=16000', '--channels=1']
     if source:
         cmd.append(f'--device={source}')
